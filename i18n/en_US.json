@@ -1,0 +1,67 @@
+{
+
+  "blockLabel": "Doc:",
+
+  "slashSubDoc": "Sub-document",
+
+  "openSubDoc": "Open document",
+
+  "createBlockFailed": "Failed to create document block",
+
+  "createDocFailed": "Failed to create document",
+
+  "deleteDocFailed": "Failed to delete linked document block",
+
+  "moveDocFailed": "Failed to move linked document",
+
+  "moveBlockFailed": "Failed to move document block",
+
+  "trashNotebookFailed": "Failed to create or locate the \"文档回收\" notebook",
+
+  "moveToTrashFailed": "Failed to move document to recycle bin",
+
+  "openSubDocBlockSetting": "Document block settings",
+
+  "settingsSaved": "Settings saved",
+
+  "settingsSaveFailed": "Failed to save settings",
+
+  "docBlockHeadingLevel": "Heading level for new document blocks",
+
+  "docBlockHeadingLevelDesc": "Heading level when creating document blocks; choose Paragraph for no heading",
+
+  "headingLevel0": "Paragraph (no heading)",
+
+  "headingLevel1": "Heading 1",
+
+  "headingLevel2": "Heading 2",
+
+  "headingLevel3": "Heading 3",
+
+  "headingLevel4": "Heading 4",
+
+  "headingLevel5": "Heading 5",
+
+  "headingLevel6": "Heading 6",
+
+  "fileTreeClickToggle": "Single-click file tree to open and expand/collapse",
+
+  "fileTreeClickToggleDesc": "SiYuan opens the doc on row click; if the row shows an expand toggle, trigger SiYuan's own expand/collapse (no custom getLeaf)",
+
+  "autoClearTrashOnStartup": "Auto-clear document recycle on startup",
+
+  "autoClearTrashOnStartupDesc": "After SiYuan starts, automatically delete unreferenced documents in \"文档回收\"",
+
+  "clearTrashNow": "Clear document recycle now",
+
+  "clearTrashNowDesc": "Scan the recycle notebook and delete documents not referenced by any document block (uses SiYuan delete, undoable)",
+
+  "clearTrashRunning": "Clearing document recycle…",
+
+  "clearTrashDeletedOne": "Deleted document: ${title} (${id})",
+
+  "clearTrashResult": "Deleted ${deleted}, kept ${kept}",
+
+  "clearTrashFailed": "Failed to clear document recycle"
+
+}

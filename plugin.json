@@ -1,0 +1,35 @@
+{
+
+  "name": "doc-block",
+
+  "author": "dev",
+
+  "version": "1.10.11",
+
+  "minAppVersion": "3.1.27",
+
+  "backends": ["all"],
+
+  "frontends": ["all"],
+
+  "displayName": {
+
+    "default": "Document Block",
+
+    "zh_CN": "文档块(父文档自动引用子文档)"
+
+  },
+
+  "description": {
+
+    "default": "Bidirectional binding between document blocks and documents; paste copies as block ref; delete owner block moves doc to recycle notebook",
+
+    "zh_CN": "文档块与文档唯一双向绑定；复制粘贴转为普通块引；删除主文档块时子文档移入「文档回收」"
+
+  },
+
+  "keywords": ["doc-block", "document", "文档块", "子文档"]
+
+}
+
+

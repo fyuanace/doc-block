@@ -1,0 +1,67 @@
+{
+
+  "blockLabel": "文档:",
+
+  "slashSubDoc": "子文档",
+
+  "openSubDoc": "打开文档",
+
+  "createBlockFailed": "创建文档块失败",
+
+  "createDocFailed": "创建文档失败",
+
+  "deleteDocFailed": "删除关联文档块失败",
+
+  "moveDocFailed": "移动关联文档失败",
+
+  "moveBlockFailed": "移动文档块失败",
+
+  "trashNotebookFailed": "创建或定位「文档回收」笔记本失败",
+
+  "moveToTrashFailed": "移动文档到回收站失败",
+
+  "openSubDocBlockSetting": "文档块设置",
+
+  "settingsSaved": "设置已保存",
+
+  "settingsSaveFailed": "保存设置失败",
+
+  "docBlockHeadingLevel": "新建文档块标题级别",
+
+  "docBlockHeadingLevelDesc": "创建文档块时使用的标题级别；选择「段落」则不使用标题",
+
+  "headingLevel0": "段落（非标题）",
+
+  "headingLevel1": "一级标题",
+
+  "headingLevel2": "二级标题",
+
+  "headingLevel3": "三级标题",
+
+  "headingLevel4": "四级标题",
+
+  "headingLevel5": "五级标题",
+
+  "headingLevel6": "六级标题",
+
+  "fileTreeClickToggle": "单击文件树打开并展开/折叠",
+
+  "fileTreeClickToggleDesc": "单击文档行时由思源打开文档；若该行显示折叠钮，再自动触发思源自带的展开/折叠（不替代内核逻辑）",
+
+  "autoClearTrashOnStartup": "启动后自动清除文档回收",
+
+  "autoClearTrashOnStartupDesc": "每次启动思源后，自动删除「文档回收」中未被引用的文档",
+
+  "clearTrashNow": "立即清除文档回收",
+
+  "clearTrashNowDesc": "扫描「文档回收」笔记本，删除未被任何文档块引用的文档（走思源删除逻辑，可撤销）",
+
+  "clearTrashRunning": "正在清除文档回收…",
+
+  "clearTrashDeletedOne": "已删除文档：${title}（${id}）",
+
+  "clearTrashResult": "已删除 ${deleted} 篇，保留 ${kept} 篇",
+
+  "clearTrashFailed": "清除文档回收失败"
+
+}
