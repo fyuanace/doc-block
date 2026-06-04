@@ -4,7 +4,9 @@
 
 <img src="image-4.png" width="50%">
 
-<img src="image copy.png" width="50%">
+---
+
+<img src="image-0.png" width="50%">
 
 # 自动同步子文档
 
@@ -14,7 +16,11 @@
 
 <img src="image-1.png" width="50%">
 
+---
+
 <img src="image-2.png" width="50%">
+
+---
 
 <img src="image-3.png" width="50%">
 
