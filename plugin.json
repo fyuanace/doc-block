@@ -27,6 +27,7 @@
     "zh_CN": "文档块与文档唯一双向绑定；复制粘贴转为普通块引；删除主文档块时子文档移入「文档回收」"
 
   },
+  "url": "https://github.com/fyuanace/doc-block",
 
   "keywords": ["doc-block", "document", "文档块", "子文档"]
 
