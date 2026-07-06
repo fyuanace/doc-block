@@ -16,7 +16,7 @@
 
   "moveBlockFailed": "移动文档块失败",
 
-  "trashNotebookFailed": "创建或定位「文档回收」笔记本失败",
+  "trashNotebookFailed": "创建或定位「垃圾箱」笔记本失败",
 
   "moveToTrashFailed": "移动文档到回收站失败",
 
@@ -48,20 +48,24 @@
 
   "fileTreeClickToggleDesc": "单击文档行时由思源打开文档；若该行显示折叠钮，再自动触发思源自带的展开/折叠（不替代内核逻辑）",
 
-  "autoClearTrashOnStartup": "启动后自动清除文档回收",
+  "autoClearTrashOnStartup": "启动后自动清除垃圾箱",
 
-  "autoClearTrashOnStartupDesc": "每次启动思源后，自动删除「文档回收」中未被引用的文档",
+  "autoClearTrashOnStartupDesc": "每次启动思源后，自动删除「垃圾箱」中未被引用的文档",
 
-  "clearTrashNow": "立即清除文档回收",
+  "debugReconcile": "调试：输出同步统计日志",
 
-  "clearTrashNowDesc": "扫描「文档回收」笔记本，删除未被任何文档块引用的文档（走思源删除逻辑，可撤销）",
+  "debugReconcileDesc": "在控制台输出 move/reconcile 的来源、处理数量与跳过数量，便于定位同步问题",
 
-  "clearTrashRunning": "正在清除文档回收…",
+  "clearTrashNow": "立即清除垃圾箱",
+
+  "clearTrashNowDesc": "扫描「垃圾箱」笔记本，删除未被任何文档块引用的文档（走思源删除逻辑，可撤销）",
+
+  "clearTrashRunning": "正在清除垃圾箱…",
 
   "clearTrashDeletedOne": "已删除文档：${title}（${id}）",
 
   "clearTrashResult": "已删除 ${deleted} 篇，保留 ${kept} 篇",
 
-  "clearTrashFailed": "清除文档回收失败"
+  "clearTrashFailed": "清除垃圾箱失败"
 
 }

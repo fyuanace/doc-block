@@ -16,7 +16,7 @@
 
   "moveBlockFailed": "Failed to move document block",
 
-  "trashNotebookFailed": "Failed to create or locate the \"文档回收\" notebook",
+  "trashNotebookFailed": "Failed to create or locate the \"垃圾箱\" notebook",
 
   "moveToTrashFailed": "Failed to move document to recycle bin",
 
@@ -50,7 +50,11 @@
 
   "autoClearTrashOnStartup": "Auto-clear document recycle on startup",
 
-  "autoClearTrashOnStartupDesc": "After SiYuan starts, automatically delete unreferenced documents in \"文档回收\"",
+  "autoClearTrashOnStartupDesc": "After SiYuan starts, automatically delete unreferenced documents in \"垃圾箱\"",
+
+  "debugReconcile": "Debug: reconciliation stats",
+
+  "debugReconcileDesc": "Print move/reconcile source and processed/skip counts in console to troubleshoot sync issues",
 
   "clearTrashNow": "Clear document recycle now",
 

@@ -1,12 +1,23 @@
 const { Plugin, Setting, fetchSyncPost, showMessage, openTab, getAllEditor, getModelByDockType } = require("siyuan");
+let nodeFs = null;
+let nodePath = null;
+try {
+    // Desktop/electron runtime only.
+    nodeFs = require("fs");
+    nodePath = require("path");
+} catch {
+    nodeFs = null;
+    nodePath = null;
+}
 
 /**
  * sub-doc-block 架构（绑定线 vs 块内容）
- * - 绑定线：删块 → scheduleDocMove(trash)；撤销 insert 且子文档在回收站 → scheduleDocMove(restore)。
- *   DOC_MOVE_DEBOUNCE_MS 只用于子文档 moveDocsByID，不改块 markdown。
- * - 块内容：创建/补块时一次文档块 markdown + setDocBlockAttrs；重命名走 syncSubDocBlockTitle。
- *   文档块判定：Properties 同时含 custom-doc-block=1 与 custom-doc-id；引用块仅 block-ref。
- *   粘贴仅块引，不升级 custom-doc-block。decorateSubDocBlocks 只加 CSS class。
+ * - 持久化：思源 attributes 双属性（custom-doc-block + custom-doc-id）+ 子文档 custom-doc-block-id
+ * - 运行时：blockToSubDoc 缓存 + enqueueSubDocSync(按子文档) + enqueueParentSync(按父文档)
+ * - 绑定线：删块 → scheduleDocMove(trash)；撤销 insert 且子文档在回收站 → scheduleDocMove(restore)
+ * - 块内容：writeDocBlockBinding 一次写入双向指针；重命名走 syncSubDocBlockTitle
+ * - 移动：块移动 → syncSubDocToTargetParent；文档树移动 → moveSubDocBlockToDoc；父文档层定时 reconcile 顺序
+ * - 创建入口：斜杠/文件树/ws-create/fetch-patch；插件 initiated 创建跳过 onSubDocCreated 重复绑块
  */
 const PLUGIN_NAME = "sub-doc-block";
 const ATTR_BLOCK = "custom-doc-block";
@@ -14,16 +25,24 @@ const ATTR_DOC_ID = "custom-doc-id";
 const ATTR_DOC_BLOCK_ID = "custom-doc-block-id";
 const STYLE_ID = "plugin-doc-block-style";
 const DEFAULT_DOC_ICON_EMOJI = "\u{1F4C4}";
-const TRASH_NOTEBOOK_NAME = "文档回收";
+const TRASH_NOTEBOOK_NAME = "垃圾箱";
+const TRASH_NOTEBOOK_LEGACY_NAMES = ["文档回收"];
+const PLUGIN_LOG_DIR = "D:/LPX/Desktop/siyuanlog";
+const DOC_CLIPBOARD_STORAGE_KEY = "__sub_doc_block_clipboard__";
+const DOC_CLIPBOARD_MODE_COPY = "copy";
+const DOC_CLIPBOARD_MODE_CUT = "cut";
 const CONFIG_STORAGE = "config.json";
 const DEFAULT_CONFIG = {
     docBlockHeadingLevel: 5,
     fileTreeClickToggle: true,
     autoClearTrashOnStartup: false,
+    debugReconcile: false,
 };
 const DEDUPE_MS = 5000;
 const SYNC_DEDUPE_MS = 800;
-/** 删块/撤块后移动子文档（进/出「文档回收」）的去抖；不修改块内容 */
+/** 文档树/块双向移动去重窗口（fetch + ws 双通道） */
+const MOVE_DEDUPE_MS = 1500;
+/** 删块/撤块后移动子文档（进/出「垃圾箱」）的去抖；不修改块内容 */
 const DOC_MOVE_DEBOUNCE_MS = 800;
 const DELETE_GUARD_MS = 5000;
 const MOVE_GUARD_MS = 5000;
@@ -31,6 +50,24 @@ const NOTEBOOK_ROOT_MOVE_KEY = "__notebook_root__";
 const WS_LOG_CMDS = new Set(["create", "removeDoc", "rename", "savedoc", "transactions", "moveDoc"]);
 const DOC_BLOCK_LABELS = "(?:文档块|文档|Document block|Document|Doc)";
 const DOC_BLOCK_HEADING_MD = "(?:#{1,6}\\s+)?";
+
+function safeSerialize(value) {
+    if (value == null) {
+        return value;
+    }
+    if (typeof value === "string" || typeof value === "number" || typeof value === "boolean") {
+        return value;
+    }
+    try {
+        return JSON.parse(JSON.stringify(value));
+    } catch {
+        try {
+            return String(value);
+        } catch {
+            return "[unserializable]";
+        }
+    }
+}
 
 function getDocBlockHeadingLevel(plugin) {
     const level = Number(plugin?.config?.docBlockHeadingLevel);
@@ -66,6 +103,11 @@ const DOC_BLOCK_INLINE_CODE_IAL_RE = new RegExp(
 
 function sleep(ms) {
     return new Promise((resolve) => window.setTimeout(resolve, ms));
+}
+
+/** 事务落库后再读 attributes / blocks，避免竞态 */
+async function flushSqlTransaction() {
+    await fetchSyncPost("/api/sqlite/flushTransaction", {});
 }
 
 async function waitForBlockRow(blockId, attempts = 6, intervalMs = 40) {
@@ -338,33 +380,111 @@ async function getHPathByDocId(docId) {
     return String(response.data).replace(/\\/g, "/");
 }
 
-async function resolveSlashProtyleContext(protyle, nodeElement) {
-    const triggerBlockId = resolveSlashTriggerBlockId(protyle, nodeElement);
+function getActiveProtyleFromEditors() {
+    const editors = getAllEditor();
+    if (!editors.length) {
+        return null;
+    }
+    const activeEl = document.activeElement;
+    if (activeEl) {
+        const fromActive = editors.find((editor) => editor?.protyle?.element?.contains?.(activeEl));
+        if (fromActive?.protyle) {
+            return fromActive.protyle;
+        }
+    }
+    const selection = window.getSelection?.();
+    const anchor = selection?.anchorNode;
+    if (anchor) {
+        const anchorEl = anchor.nodeType === Node.ELEMENT_NODE ? anchor : anchor.parentElement;
+        const fromSelection = editors.find((editor) => editor?.protyle?.wysiwyg?.element?.contains?.(anchorEl));
+        if (fromSelection?.protyle) {
+            return fromSelection.protyle;
+        }
+    }
+    const focusedProtyleEl = document.querySelector(".protyle.protyle--focus, .layout-tab-bar .item--focus + .fn__flex-1 .protyle");
+    if (focusedProtyleEl) {
+        const fromFocusClass = editors.find((editor) => editor?.protyle?.element === focusedProtyleEl
+            || editor?.protyle?.element?.contains?.(focusedProtyleEl));
+        if (fromFocusClass?.protyle) {
+            return fromFocusClass.protyle;
+        }
+    }
+    return editors[editors.length - 1]?.protyle || null;
+}
 
-    let block = protyle?.block
+function resolveCursorBlockId(protyle) {
+    const wysiwyg = protyle?.wysiwyg?.element
+        || protyle?.element?.querySelector?.(".protyle-wysiwyg");
+    if (!wysiwyg) {
+        return null;
+    }
+    const selection = window.getSelection?.();
+    if (!selection?.rangeCount) {
+        return null;
+    }
+    let anchor = selection.anchorNode;
+    if (anchor?.nodeType === Node.TEXT_NODE) {
+        anchor = anchor.parentElement;
+    }
+    const blockEl = anchor?.closest?.("[data-node-id]");
+    const blockId = blockEl?.getAttribute?.("data-node-id") || null;
+    const rootId = protyle?.block?.rootID || protyle?.block?.rootId || null;
+    if (!blockId || blockId === rootId) {
+        return null;
+    }
+    return blockId;
+}
+
+function getProtyleFromNode(nodeElement) {
+    if (!nodeElement) {
+        return null;
+    }
+    const wysiwyg = nodeElement.closest?.(".protyle-wysiwyg");
+    if (wysiwyg) {
+        return getProtyleFromWysiwyg(wysiwyg);
+    }
+    const protyleEl = nodeElement.closest?.(".protyle");
+    if (!protyleEl) {
+        return null;
+    }
+    const editor = getAllEditor().find((item) => item?.protyle?.element === protyleEl
+        || item?.protyle?.element?.contains?.(protyleEl));
+    return editor?.protyle || null;
+}
+
+async function resolveSlashProtyleContext(protyle, nodeElement) {
+    const activeProtyle = (nodeElement ? getProtyleFromNode(nodeElement) : null)
+        || protyle
+        || getActiveProtyleFromEditors();
+
+    const triggerBlockId = resolveSlashTriggerBlockId(activeProtyle || protyle, nodeElement)
+        || resolveCursorBlockId(activeProtyle || protyle);
+
+    let block = activeProtyle?.block
+        || protyle?.block
         || protyle?.protyle?.block
         || protyle?.getInstance?.()?.block
         || null;
 
     if (!block && nodeElement) {
-        const editors = getAllEditor();
-        const hostEditor = editors.find((editor) => editor?.protyle?.element?.contains?.(nodeElement));
+        const hostEditor = getAllEditor().find((editor) => editor?.protyle?.element?.contains?.(nodeElement));
         block = hostEditor?.protyle?.block || null;
-    }
-
-    if (!block) {
-        const activeEditor = getAllEditor()[0];
-        block = activeEditor?.protyle?.block || null;
     }
 
     const blockId = triggerBlockId || block?.id || null;
 
-    let rootDocId = block?.rootID || block?.rootId || null;
+    let rootDocId = null;
+    if (triggerBlockId) {
+        rootDocId = await getBlockRootId(triggerBlockId);
+    }
+    if (!rootDocId && block) {
+        rootDocId = block.rootID || block.rootId || null;
+    }
     if (!rootDocId && blockId) {
         rootDocId = await getBlockRootId(blockId);
     }
 
-    return { block, blockId, rootDocId };
+    return { block, blockId, rootDocId, protyle: activeProtyle || protyle || null };
 }
 
 function resolveSlashTriggerBlockId(protyle, nodeElement) {
@@ -372,12 +492,22 @@ function resolveSlashTriggerBlockId(protyle, nodeElement) {
         const fromNode = nodeElement.getAttribute?.("data-node-id")
             || nodeElement.closest?.("[data-node-id]")?.getAttribute("data-node-id");
         if (fromNode) {
-            return fromNode;
+            const rootId = protyle?.block?.rootID || protyle?.block?.rootId || null;
+            if (!rootId || fromNode !== rootId) {
+                return fromNode;
+            }
         }
     }
-    return protyle?.block?.id
-        || protyle?.getInstance?.()?.block?.id
-        || null;
+    const fromCursor = resolveCursorBlockId(protyle);
+    if (fromCursor) {
+        return fromCursor;
+    }
+    const blockId = protyle?.block?.id || protyle?.getInstance?.()?.block?.id || null;
+    const rootId = protyle?.block?.rootID || protyle?.block?.rootId || null;
+    if (blockId && blockId !== rootId) {
+        return blockId;
+    }
+    return null;
 }
 
 function clearSlashTextInBlock(nodeElement) {
@@ -395,6 +525,121 @@ function clearSlashTextInBlock(nodeElement) {
     }
 }
 
+function getBlockEditElement(blockElement) {
+    if (!blockElement) {
+        return null;
+    }
+    if (blockElement.classList.contains("protyle-title__input")) {
+        return blockElement;
+    }
+    if (blockElement.getAttribute("contenteditable") === "true") {
+        return blockElement;
+    }
+    return blockElement.querySelector('[contenteditable="true"]');
+}
+
+function getRangeOffsetInElement(editElement, range) {
+    if (!editElement || !range) {
+        return { start: 0, end: 0 };
+    }
+    try {
+        const startRange = range.cloneRange();
+        startRange.selectNodeContents(editElement);
+        startRange.setEnd(range.startContainer, range.startOffset);
+        const start = startRange.toString().length;
+        return { start, end: start + range.toString().length };
+    } catch {
+        return { start: 0, end: 0 };
+    }
+}
+
+function resolveBackStackBlockElement(protyle, blockId, nodeElement) {
+    if (nodeElement?.closest) {
+        const fromNode = nodeElement.closest("[data-node-id]");
+        if (fromNode) {
+            return fromNode;
+        }
+    }
+    if (blockId && protyle?.wysiwyg?.element) {
+        return protyle.wysiwyg.element.querySelector(`[data-node-id="${blockId}"]`);
+    }
+    return null;
+}
+
+/**
+ * 插件 openTab 打开子文档时，思源不会把父文档当前光标压入 backStack。
+ * 侧键/工具栏后退因此会跳过父文档，落到更早的历史位置。
+ * 这里按思源 pushBack 的结构补一条记录。
+ */
+function pushProtyleBackStack(protyle, blockId, nodeElement) {
+    if (!protyle?.model || !Array.isArray(window.siyuan?.backStack)) {
+        return false;
+    }
+    const blockElement = resolveBackStackBlockElement(protyle, blockId, nodeElement);
+    const editElement = getBlockEditElement(blockElement);
+    if (!blockElement || !editElement) {
+        return false;
+    }
+
+    const id = blockElement.getAttribute("data-node-id") || protyle.block?.rootID;
+    if (!id) {
+        return false;
+    }
+
+    const selection = document.getSelection();
+    const range = (protyle.toolbar?.range && blockElement.contains(protyle.toolbar.range.startContainer))
+        ? protyle.toolbar.range
+        : (selection?.rangeCount > 0 && blockElement.contains(selection.getRangeAt(0).startContainer)
+            ? selection.getRangeAt(0)
+            : null);
+    const position = range
+        ? getRangeOffsetInElement(editElement, range)
+        : { start: editElement.textContent?.length || 0, end: editElement.textContent?.length || 0 };
+
+    const zoomId = protyle.block?.showAll ? protyle.block.id : undefined;
+    const backStack = window.siyuan.backStack;
+    const lastStack = backStack[backStack.length - 1];
+    const sameBlock = lastStack && lastStack.id === id && (
+        (protyle.block?.showAll && lastStack.zoomId === protyle.block.id)
+        || (!lastStack.zoomId && !protyle.block?.showAll)
+    );
+    if (sameBlock) {
+        lastStack.position = position;
+        lastStack.protyle = protyle;
+        return true;
+    }
+
+    backStack.push({
+        position,
+        id,
+        protyle,
+        zoomId,
+    });
+    const maxSize = window.siyuan?.config?.editor?.historyCount || 64;
+    if (backStack.length > maxSize) {
+        backStack.shift();
+    }
+    document.querySelector("#barBack")?.classList.remove("toolbar__item--disabled");
+    return true;
+}
+
+function syncSlashToolbarRange(protyle, nodeElement) {
+    if (!protyle || !nodeElement) {
+        return;
+    }
+    const editable = nodeElement.querySelector?.('[contenteditable="true"]');
+    if (!editable) {
+        return;
+    }
+    const range = document.createRange();
+    range.selectNodeContents(editable);
+    range.collapse(false);
+    if (!protyle.toolbar) {
+        protyle.toolbar = {};
+    }
+    protyle.toolbar.range = range;
+}
+
 async function lsNotebooks() {
     const response = await fetchSyncPost("/api/notebook/lsNotebooks", {});
     if (response.code !== 0) {
@@ -406,6 +651,31 @@ async function lsNotebooks() {
 async function findNotebookByName(name) {
     const notebooks = await lsNotebooks();
     return notebooks.find((notebook) => notebook.name === name) || null;
+}
+
+async function findTrashNotebook() {
+    const primary = await findNotebookByName(TRASH_NOTEBOOK_NAME);
+    if (primary?.id) {
+        return primary;
+    }
+    for (const legacyName of TRASH_NOTEBOOK_LEGACY_NAMES) {
+        const legacy = await findNotebookByName(legacyName);
+        if (legacy?.id) {
+            return legacy;
+        }
+    }
+    return null;
+}
+
+async function waitForTrashNotebook(attempts = 10, intervalMs = 150) {
+    for (let i = 0; i < attempts; i++) {
+        const notebook = await findTrashNotebook();
+        if (notebook?.id) {
+            return notebook;
+        }
+        await sleep(intervalMs);
+    }
+    return null;
 }
 
 async function waitForNotebookByName(name, attempts = 10, intervalMs = 150) {
@@ -554,6 +824,71 @@ function cleanTitle(text) {
         .trim();
 }
 
+function setDocClipboardState(state) {
+    if (!state || !state.mode || !state.subDocId) {
+        return;
+    }
+    const normalized = {
+        mode: state.mode,
+        subDocId: String(state.subDocId),
+        sourceTitle: cleanTitle(state.sourceTitle || ""),
+        sourceBlockId: state.sourceBlockId ? String(state.sourceBlockId) : null,
+        sourceParentDocId: state.sourceParentDocId ? String(state.sourceParentDocId) : null,
+        updatedAt: Date.now(),
+    };
+    window.__subDocBlockClipboardState = normalized;
+    try {
+        window.sessionStorage?.setItem(DOC_CLIPBOARD_STORAGE_KEY, JSON.stringify(normalized));
+    } catch {
+        // ignore storage failures
+    }
+    console.log(`[${PLUGIN_NAME}]`, "clipboard.set", {
+        mode: normalized.mode,
+        subDocId: normalized.subDocId,
+        sourceBlockId: normalized.sourceBlockId,
+        sourceParentDocId: normalized.sourceParentDocId,
+    });
+}
+
+function getDocClipboardState() {
+    const inMemory = window.__subDocBlockClipboardState;
+    if (inMemory?.mode && inMemory?.subDocId) {
+        return inMemory;
+    }
+    try {
+        const raw = window.sessionStorage?.getItem(DOC_CLIPBOARD_STORAGE_KEY);
+        if (!raw) {
+            return null;
+        }
+        const parsed = JSON.parse(raw);
+        if (!parsed?.mode || !parsed?.subDocId) {
+            return null;
+        }
+        window.__subDocBlockClipboardState = parsed;
+        console.log(`[${PLUGIN_NAME}]`, "clipboard.restore-from-session", {
+            mode: parsed.mode,
+            subDocId: parsed.subDocId,
+        });
+        return parsed;
+    } catch {
+        return null;
+    }
+}
+
+function clearDocClipboardState() {
+    delete window.__subDocBlockClipboardState;
+    try {
+        window.sessionStorage?.removeItem(DOC_CLIPBOARD_STORAGE_KEY);
+    } catch {
+        // ignore storage failures
+    }
+    console.log(`[${PLUGIN_NAME}]`, "clipboard.clear");
+}
+
+function resolvePasteDocTitle(sourceTitle) {
+    return cleanTitle(sourceTitle || "未命名") || "未命名";
+}
+
 function parseTitleFromDocBlockCodeText(text, blockLabel) {
     const raw = cleanTitle(text);
     if (!raw) {
@@ -651,7 +986,7 @@ function isCorrectDocBlockPresentation(blockEl) {
         return false;
     }
     if (blockEl.querySelector("[data-sub-doc-readonly]")) {
-        return false;
+        return true;
     }
     if (docBlockHasBrokenChipMarkup(blockEl)) {
         return false;
@@ -928,6 +1263,27 @@ function buildPasteAsDocRefs(refs) {
 }
 
 const SIYUAN_CLIPBOARD_ZWSP = "\u200b";
+
+/**
+ * 接管文档块粘贴时，用无害内容替换剪贴板三字段。
+ *
+ * 思源 paste.ts 仅在 response.textHTML / textPlain / siyuanHTML 为 truthy 时才覆盖原剪贴板；
+ * 传空字符串会被忽略，原 siyuanHTML（含旧文档块）仍会走默认粘贴 → id:"" / txerr。
+ * 见：https://github.com/siyuan-note/siyuan/blob/master/app/src/protyle/util/paste.ts
+ */
+function resolvePasteNoop(detail) {
+    const noop = SIYUAN_CLIPBOARD_ZWSP;
+    detail.resolve({
+        textHTML: noop,
+        textPlain: noop,
+        siyuanHTML: noop,
+    });
+    return {
+        textHTML: noop,
+        textPlain: noop,
+        siyuanHTML: noop,
+    };
+}
 
 function encodeClipboardBase64(text) {
     const binary = encodeURIComponent(String(text ?? "")).replace(/%([0-9A-F]{2})/g, (_, hex) => String.fromCharCode(parseInt(hex, 16)));
@@ -1296,7 +1652,7 @@ function scheduleRewriteClipboardAsDocRefs(refs) {
     window.setTimeout(write, 80);
 }
 
-function handleCopyCapture(event) {
+function handleCopyCapture(event, plugin = null) {
     const tag = event.target?.tagName;
     if (tag === "INPUT" || tag === "TEXTAREA" || tag === "PROTYLE-HTML") {
         return;
@@ -1308,15 +1664,39 @@ function handleCopyCapture(event) {
     const selected = getSelectedBlockElements(wysiwyg);
     const refs = extractDocRefsFromSelection(wysiwyg);
     if (refs.length === 0) {
+        if (event.type === "copy" || event.type === "cut") {
+            clearDocClipboardState();
+        }
         return;
     }
     const protyle = getProtyleFromWysiwyg(wysiwyg);
     const onlyDocBlocks = !selectionHasNonDocBlocks(wysiwyg)
         && selected.length > 0
         && selected.every((blockEl) => isDocBlockLikeElement(blockEl));
+    const sourceParentDocId = protyle?.block?.rootID
+        || protyle?.block?.rootId
+        || protyle?.getInstance?.()?.block?.rootID
+        || null;
+    const sourceBlockId = selected[0]?.getAttribute?.("data-node-id") || null;
 
     if (event.type === "copy") {
         if (onlyDocBlocks) {
+            plugin?.logEvent("user.copy.doc-block", {
+                refs: refs.map((ref) => ref.docId),
+                sourceParentDocId,
+                sourceBlockId,
+            });
+            if (refs.length === 1) {
+                setDocClipboardState({
+                    mode: DOC_CLIPBOARD_MODE_COPY,
+                    subDocId: refs[0].docId,
+                    sourceTitle: refs[0].title,
+                    sourceBlockId,
+                    sourceParentDocId,
+                });
+            } else {
+                clearDocClipboardState();
+            }
             event.preventDefault();
             event.stopPropagation();
             event.stopImmediatePropagation();
@@ -1324,6 +1704,11 @@ function handleCopyCapture(event) {
             console.log(`[${PLUGIN_NAME}]`, "copy as doc ref", refs);
             return;
         }
+        plugin?.logEvent("user.copy.mixed-selection", {
+            blockCount: selected.length,
+            refs: refs.map((ref) => ref.docId),
+        });
+        clearDocClipboardState();
         if (!protyle?.lute || selected.length === 0) {
             return;
         }
@@ -1337,8 +1722,31 @@ function handleCopyCapture(event) {
     }
 
     if (event.type === "cut" && onlyDocBlocks) {
+        plugin?.logEvent("user.cut.doc-block", {
+            refs: refs.map((ref) => ref.docId),
+            sourceParentDocId,
+            sourceBlockId,
+        });
+        if (refs.length === 1) {
+            setDocClipboardState({
+                mode: DOC_CLIPBOARD_MODE_CUT,
+                subDocId: refs[0].docId,
+                sourceTitle: refs[0].title,
+                sourceBlockId,
+                sourceParentDocId,
+            });
+        } else {
+            clearDocClipboardState();
+        }
         scheduleRewriteClipboardAsDocRefs(refs);
         console.log(`[${PLUGIN_NAME}]`, "cut clipboard rewrite as doc ref", refs);
+        return;
+    }
+    if (event.type === "cut") {
+        plugin?.logEvent("user.cut.non-doc-selection", {
+            refs: refs.map((ref) => ref.docId),
+        });
+        clearDocClipboardState();
     }
 }
 
@@ -1590,21 +1998,31 @@ function injectStyles() {
         document.head.appendChild(style);
     }
     style.textContent = `
-${buildDocBlockStyleSelectors(" > div[contenteditable]")} {
-    display: inline;
-    background-color: var(--b3-protyle-code-background);
-    border-radius: var(--b3-border-radius);
-    padding: .2em .4em;
-    box-decoration-break: clone;
-    -webkit-box-decoration-break: clone;
+${buildDocBlockStyleSelectors("")} {
+    display: block;
+    width: 100%;
+    margin: .25em 0;
+}
+${buildDocBlockStyleSelectors(" [contenteditable]")} {
+    display: block;
+    width: 100%;
     cursor: pointer;
+    user-select: none;
+    caret-color: transparent;
 }
 ${buildDocBlockStyleSelectors(" span[data-type~=\"block-ref\"]")} {
+    display: inline;
     font: inherit;
     font-weight: inherit;
     font-size: inherit;
     line-height: inherit;
     color: inherit;
+    background: none;
+    border-radius: 0;
+    padding: 0;
+    text-decoration: underline;
+    text-underline-offset: 2px;
+    text-decoration-thickness: 1px;
     cursor: pointer;
 }
 `;
@@ -1622,9 +2040,15 @@ function decorateSubDocBlocks(root = document, plugin = null) {
         if (plugin) {
             plugin.rememberBlockSubDoc(blockId, docId);
         }
-        styleTarget.classList.add("sub-doc-block");
+        blockEl.classList.add("sub-doc-block");
         if (!styleTarget.dataset.subDocBound) {
             styleTarget.dataset.subDocBound = "true";
+        }
+        const editable = blockEl.querySelector('[contenteditable="true"]');
+        if (editable && editable.getAttribute("contenteditable") !== "false") {
+            editable.setAttribute("contenteditable", "false");
+            editable.setAttribute("data-sub-doc-readonly", "true");
+            editable.setAttribute("spellcheck", "false");
         }
     };
 
@@ -1723,6 +2147,19 @@ async function setDocBlockAttrs(blockId, docId, extraAttrs = {}, options = {}) {
     return response.code === 0;
 }
 
+/** 写入双向绑定：块属性 + 子文档反向指针 */
+async function writeDocBlockBinding(blockId, subDocId, options = {}) {
+    if (!blockId || !subDocId) {
+        return false;
+    }
+    const attrsOk = await setDocBlockAttrs(blockId, subDocId, {}, options);
+    if (!attrsOk) {
+        return false;
+    }
+    await setDocBlockIdOnDoc(subDocId, blockId);
+    return true;
+}
+
 async function setDocBlockIdOnDoc(docId, blockId) {
     if (!docId || !blockId) {
         return;
@@ -1755,64 +2192,29 @@ async function getDocBlockIdFromDoc(docId) {
     return attrs?.[ATTR_DOC_BLOCK_ID] || null;
 }
 
-async function getSubDocIdFromBlock(blockId) {
+/**
+ * 解析文档块绑定（权威路径：SQL 双属性）。
+ * @param {object} [options]
+ * @param {boolean} [options.strict=true] true 时仅认 custom-doc-block=1 + custom-doc-id
+ */
+async function getSubDocIdFromBlock(blockId, options = {}) {
     if (!blockId) {
         return null;
     }
 
-    const sqlAttrs = await queryBlockAttrsFromSql(blockId);
-    if (sqlAttrs?.[ATTR_DOC_ID]) {
-        return sqlAttrs[ATTR_DOC_ID];
+    const strict = options.strict !== false;
+    const binding = await getDocBlockBindingFromBlockId(blockId);
+    if (binding?.subDocId) {
+        return binding.subDocId;
     }
-
-    const domSubDocId = readSubDocIdFromDom(blockId);
-    if (domSubDocId) {
-        return domSubDocId;
-    }
-
-    if (!(await isBlockRowPresent(blockId))) {
+    if (strict) {
         return null;
     }
 
-    const attrs = await getBlockAttrs(blockId, { skipWait: true, preferSql: true });
-    if (attrs?.[ATTR_DOC_ID]) {
-        return attrs[ATTR_DOC_ID];
-    }
-
-    const escapedId = escapeSqlLiteral(blockId);
-    const relatedStmt = `
-        select a.value as sub_doc_id from attributes a
-        where a.name = '${ATTR_DOC_ID}'
-        and a.block_id in (
-            select id from blocks where id = '${escapedId}'
-            union
-            select id from blocks where parent_id = '${escapedId}'
-            union
-            select parent_id from blocks where id = '${escapedId}' and parent_id != ''
-        )
-        limit 1
-    `;
-    const relatedSql = await fetchSyncPost("/api/query/sql", { stmt: relatedStmt });
-    if (relatedSql.code === 0 && relatedSql.data?.[0]?.sub_doc_id) {
-        return relatedSql.data[0].sub_doc_id;
-    }
-
-    const ialStmt = `
-        select ial from blocks
-        where id = '${escapedId}'
-           or parent_id = '${escapedId}'
-           or id = (select parent_id from blocks where id = '${escapedId}' limit 1)
-        limit 5
-    `;
-    const ialSql = await fetchSyncPost("/api/query/sql", { stmt: ialStmt });
-    for (const row of ialSql.data || []) {
-        const match = (row.ial || "").match(new RegExp(`"${ATTR_DOC_ID}"\\s*:\\s*"([^"]+)"`));
-        if (match?.[1]) {
-            return match[1];
-        }
-    }
-
-    return null;
+    // 非严格模式：仅用于删除恢复；不再做 parent/child 关联块扫描（易误判且极慢）
+    const attrs = await queryBlockAttrsFromSql(blockId);
+    const looseBinding = getDocBlockBindingFromProperties(attrs);
+    return looseBinding?.subDocId || null;
 }
 
 async function getBlockRootId(blockId) {
@@ -1974,6 +2376,23 @@ function normalizeWsTransactions(data) {
     return [data];
 }
 
+function summarizeTransactionOps(transactions) {
+    const summary = [];
+    for (const tx of normalizeWsTransactions(transactions)) {
+        for (const op of tx.doOperations || tx.DoOperations || []) {
+            const blockId = getOpBlockId(op);
+            summary.push({
+                action: getOpAction(op),
+                blockId,
+                parentID: getOpParentId(op),
+                dataId: op?.data?.id || null,
+                hasEmptyId: !blockId,
+            });
+        }
+    }
+    return summary;
+}
+
 function getOpAction(op) {
     return op?.action || op?.Action || "";
 }
@@ -2058,6 +2477,18 @@ async function resolveTargetDocIdForOp(op, blockId, plugin) {
     return null;
 }
 
+/** 从 op 数据或内存缓存解析 subDocId，避免对每个 transaction op 打 SQL */
+function resolveSubDocIdFromOpOrCache(op, blockId, plugin) {
+    const fromOp = extractSubDocIdFromOpData(op?.data || op?.Data);
+    if (fromOp) {
+        return fromOp;
+    }
+    if (blockId && plugin?.blockToSubDoc?.has(blockId)) {
+        return plugin.blockToSubDoc.get(blockId);
+    }
+    return null;
+}
+
 async function analyzeTransactionSubDocOps(tx, plugin) {
     const ops = tx.doOperations || tx.DoOperations || [];
     const deletedSubDocIds = new Map();
@@ -2081,9 +2512,13 @@ async function analyzeTransactionSubDocOps(tx, plugin) {
             continue;
         }
 
-        let subDocId = extractSubDocIdFromOpData(op.data || op.Data);
-        if (!subDocId) {
-            subDocId = await plugin.resolveSubDocIdForBlock(blockId);
+        let subDocId = resolveSubDocIdFromOpOrCache(op, blockId, plugin);
+        if (!subDocId && (action === "move" || isDocBlockOpData(op.data || op?.Data))) {
+            const binding = await getDocBlockBindingFromBlockId(blockId);
+            subDocId = binding?.subDocId || null;
+            if (subDocId) {
+                plugin.rememberBlockSubDoc(blockId, subDocId);
+            }
         }
         if (!subDocId) {
             continue;
@@ -2240,6 +2675,35 @@ function docIdFromFromPathEntry(entry) {
     return null;
 }
 
+function buildMoveEventSignature(moveInfo) {
+    if (!moveInfo) {
+        return null;
+    }
+    if (moveInfo.byId && Array.isArray(moveInfo.fromIDs)) {
+        const from = [...moveInfo.fromIDs].filter(Boolean).map(String).sort().join(",");
+        const to = String(moveInfo.toID || "");
+        if (!from || !to) {
+            return null;
+        }
+        return `id:${from}->${to}`;
+    }
+    if (Array.isArray(moveInfo.fromPaths)) {
+        const fromIds = moveInfo.fromPaths
+            .map((entry) => docIdFromFromPathEntry(entry))
+            .filter(Boolean)
+            .map(String)
+            .sort()
+            .join(",");
+        const toPath = String(moveInfo.toPath ?? "");
+        const toNotebook = String(moveInfo.toNotebook ?? "");
+        if (!fromIds || (!toPath && !toNotebook)) {
+            return null;
+        }
+        return `path:${fromIds}->${toNotebook}:${toPath}`;
+    }
+    return null;
+}
+
 function resolveTargetFromMoveToPath(toPath) {
     if (toPath == null || toPath === "") {
         return null;
@@ -2305,44 +2769,121 @@ async function resolveMoveTargetParentDocId(moveInfo, subDocId, plugin) {
         return null;
     };
 
-    const hints = [];
     if (moveInfo.byId && moveInfo.toID) {
         const hint = await normalizeTargetDocId(moveInfo.toID);
         if (hint) {
-            hints.push(hint);
+            return hint;
         }
     }
     if (moveInfo.toPath) {
         const hint = await normalizeTargetDocId(resolveTargetFromMoveToPath(moveInfo.toPath));
         if (hint) {
-            hints.push(hint);
+            return hint;
         }
     }
 
-    for (let i = 0; i < 10; i++) {
-        await fetchSyncPost("/api/sqlite/flushTransaction", {});
+    await flushSqlTransaction();
+    for (let i = 0; i < 3; i++) {
         const sqlParent = await normalizeTargetDocId(await resolveParentDocIdFromSql(subDocId));
         if (sqlParent) {
             return sqlParent;
         }
-        if (i < 9) {
-            await sleep(50);
-        }
-    }
-
-    for (const hint of hints) {
-        if (hint) {
-            return hint;
+        if (i < 2) {
+            await sleep(40);
         }
     }
 
     return null;
 }
 
+function extractDocIdFromListDocsEntry(entry) {
+    if (!entry) {
+        return null;
+    }
+    if (typeof entry.id === "string") {
+        return entry.id;
+    }
+    if (typeof entry.ID === "string") {
+        return entry.ID;
+    }
+    const p = entry.path || entry.Path;
+    if (typeof p === "string" && p.endsWith(".sy")) {
+        return docIdFromStoragePath(p);
+    }
+    return null;
+}
+
+async function listChildDocIdsByParentFromTree(parentDocId) {
+    if (!parentDocId) {
+        return [];
+    }
+    const pathInfo = await getPathInfoByDocId(parentDocId);
+    if (!pathInfo?.notebook || !pathInfo?.path) {
+        return [];
+    }
+    const listPath = String(pathInfo.path).replace(/\\/g, "/").replace(/\.sy$/i, "");
+    const response = await fetchSyncPost("/api/filetree/listDocsByPath", {
+        notebook: pathInfo.notebook,
+        path: listPath,
+        maxListCount: 0,
+        showHidden: true,
+    });
+    if (response.code !== 0 || !Array.isArray(response.data?.files)) {
+        return [];
+    }
+    return response.data.files
+        .map((entry) => extractDocIdFromListDocsEntry(entry))
+        .filter((id) => !!id);
+}
+
+async function listDocBlockSubDocOrderInParent(parentDocId) {
+    if (!parentDocId) {
+        return [];
+    }
+    const escaped = escapeSqlLiteral(parentDocId);
+    const stmtWithSort = `
+        select a.value as sub_doc_id
+        from attributes a
+        inner join attributes b on b.block_id = a.block_id
+        inner join blocks bl on bl.id = a.block_id
+        where a.name = '${ATTR_DOC_ID}'
+          and b.name = '${ATTR_BLOCK}' and b.value = '1'
+          and bl.root_id = '${escaped}'
+        order by bl.sort asc, bl.id asc
+    `;
+    let response = await fetchSyncPost("/api/query/sql", { stmt: stmtWithSort });
+    if (response.code !== 0) {
+        const stmtFallback = `
+            select a.value as sub_doc_id
+            from attributes a
+            inner join attributes b on b.block_id = a.block_id
+            inner join blocks bl on bl.id = a.block_id
+            where a.name = '${ATTR_DOC_ID}'
+              and b.name = '${ATTR_BLOCK}' and b.value = '1'
+              and bl.root_id = '${escaped}'
+            order by bl.created asc, bl.id asc
+        `;
+        response = await fetchSyncPost("/api/query/sql", { stmt: stmtFallback });
+    }
+    if (response.code !== 0 || !Array.isArray(response.data)) {
+        return [];
+    }
+    return response.data
+        .map((row) => row.sub_doc_id)
+        .filter((id) => !!id);
+}
+
 async function applyApiContext(ctx, plugin, source) {
     if (!ctx) {
         return;
     }
+    plugin?.logEvent?.("api-context.apply.start", {
+        source,
+        treeDocDeletes: ctx.treeDocDeletes?.length || 0,
+        deletedDocBlockIds: ctx.deletedDocBlockIds?.length || 0,
+        hasRename: !!ctx.rename,
+        hasMoveDocs: !!ctx.moveDocs,
+    });
 
     for (const { docId, blockId } of ctx.treeDocDeletes) {
         await plugin.onSubDocRemovedFromTree(docId, blockId, source);
@@ -2356,14 +2897,17 @@ async function applyApiContext(ctx, plugin, source) {
             }
             if (await isDeletedDocBlockStillPresent(blockId, subDocId)) {
                 console.log(`[${PLUGIN_NAME}]`, `applyApiContext skip stale delete(${source})`, { blockId, subDocId });
+                plugin?.logEvent?.("api-context.delete.skip-stale", { source, blockId, subDocId });
                 continue;
             }
             if (!(await plugin.isCanonicalOwnerBlock(subDocId, blockId))) {
                 plugin.forgetBlockSubDoc(blockId);
+                plugin?.logEvent?.("api-context.delete.skip-non-canonical", { source, blockId, subDocId });
                 continue;
             }
             plugin.scheduleDocMove(subDocId, "trash", { blockId, source: `${source}-delete-block` });
             plugin.forgetBlockSubDoc(blockId);
+            plugin?.logEvent?.("api-context.delete.schedule-trash", { source, blockId, subDocId });
         }
     }
 
@@ -2374,6 +2918,7 @@ async function applyApiContext(ctx, plugin, source) {
     if (ctx.moveDocs) {
         await plugin.handleDocMove(ctx.moveDocs, source);
     }
+    plugin?.logEvent?.("api-context.apply.done", { source });
 }
 
 function shouldApplyApiContext(url, ctx) {
@@ -2400,10 +2945,21 @@ module.exports = class SubDocBlockPlugin extends Plugin {
     docMovePending = new Map();
     recentCreateKeys = new Map();
     recentDocMoveKeys = new Map();
+    recentMoveEventKeys = new Map();
     recentSyncKeys = new Map();
     blockToSubDoc = new Map();
+    subDocSyncChains = new Map();
+    parentSyncChains = new Map();
+    parentReconcileTimers = new Map();
+    cacheRefreshTimer = null;
+    loggerReady = false;
+    logSessionId = null;
+    logFilePath = null;
+    logWriteQueue = Promise.resolve();
+    originalConsoleMethods = null;
     creatingSubDocForParent = new Set();
     insertingSubDocBlocks = new Set();
+    bindSubDocBlockPromises = new Map();
     syncingDeleteBlockForDoc = new Set();
     syncingTrashDocForBlock = new Set();
     trashingSubDocIds = new Set();
@@ -2418,7 +2974,92 @@ module.exports = class SubDocBlockPlugin extends Plugin {
     topBarEntry = null;
     clearingTrash = false;
 
+    initSessionLogger() {
+        if (!nodeFs || !nodePath) {
+            this.loggerReady = false;
+            return;
+        }
+        try {
+            nodeFs.mkdirSync(PLUGIN_LOG_DIR, { recursive: true });
+            const now = new Date();
+            const pad = (n) => String(n).padStart(2, "0");
+            const stamp = `${now.getFullYear()}${pad(now.getMonth() + 1)}${pad(now.getDate())}-${pad(now.getHours())}${pad(now.getMinutes())}${pad(now.getSeconds())}`;
+            const session = `${stamp}-${Math.random().toString(36).slice(2, 8)}`;
+            this.logSessionId = session;
+            this.logFilePath = nodePath.join(PLUGIN_LOG_DIR, `${PLUGIN_NAME}-${session}.jsonl`);
+            nodeFs.writeFileSync(this.logFilePath, "", "utf8");
+            nodeFs.writeFileSync(nodePath.join(PLUGIN_LOG_DIR, "latest.txt"), `${this.logFilePath}\n`, "utf8");
+            this.loggerReady = true;
+            this.logEvent("session.start", {
+                session: this.logSessionId,
+                file: this.logFilePath,
+            });
+        } catch (error) {
+            this.loggerReady = false;
+            console.warn(`[${PLUGIN_NAME}]`, "initSessionLogger failed", error);
+            showMessage(`[${PLUGIN_NAME}] 日志初始化失败，无法写入 ${PLUGIN_LOG_DIR}`);
+        }
+    }
+
+    logEvent(event, payload = {}) {
+        if (!this.loggerReady || !this.logFilePath || !nodeFs) {
+            return;
+        }
+        const entry = {
+            ts: new Date().toISOString(),
+            session: this.logSessionId,
+            event,
+            payload: safeSerialize(payload),
+        };
+        const line = `${JSON.stringify(entry)}\n`;
+        this.logWriteQueue = this.logWriteQueue
+            .then(() => nodeFs.promises.appendFile(this.logFilePath, line, "utf8"))
+            .catch(() => {});
+    }
+
+    installConsoleMirror() {
+        if (this.originalConsoleMethods || !this.loggerReady) {
+            return;
+        }
+        this.originalConsoleMethods = {
+            log: console.log.bind(console),
+            warn: console.warn.bind(console),
+            error: console.error.bind(console),
+        };
+        const plugin = this;
+        const mirror = (level, args) => {
+            const original = plugin.originalConsoleMethods?.[level];
+            if (original) {
+                original(...args);
+            }
+            try {
+                const text = args.map((item) => (typeof item === "string" ? item : JSON.stringify(safeSerialize(item)))).join(" ");
+                if (text.includes(PLUGIN_NAME) || text.includes("reconcile")) {
+                    plugin.logEvent(`console.${level}`, { text });
+                }
+            } catch {
+                // ignore mirror serialize error
+            }
+        };
+        console.log = (...args) => mirror("log", args);
+        console.warn = (...args) => mirror("warn", args);
+        console.error = (...args) => mirror("error", args);
+    }
+
+    uninstallConsoleMirror() {
+        if (!this.originalConsoleMethods) {
+            return;
+        }
+        console.log = this.originalConsoleMethods.log;
+        console.warn = this.originalConsoleMethods.warn;
+        console.error = this.originalConsoleMethods.error;
+        this.originalConsoleMethods = null;
+    }
+
     onload() {
+        this.initSessionLogger();
+        this.installConsoleMirror();
+        this.logEvent("plugin.onload.start");
         console.log(`loading ${PLUGIN_NAME}`);
         injectStyles();
         this.configReady = this.loadPluginConfig().catch((error) => {
@@ -2446,9 +3087,7 @@ module.exports = class SubDocBlockPlugin extends Plugin {
 
         this.protyleLoadHandler = (event) => {
             decorateSubDocBlocks(document, this);
-            this.refreshBlockSubDocCache("protyle-load").catch((error) => {
-                console.warn(`[${PLUGIN_NAME}]`, "refreshBlockSubDocCache failed", error);
-            });
+            this.scheduleRefreshBlockSubDocCache("protyle-load");
         };
         this.eventBus.on("loaded-protyle-dynamic", this.protyleLoadHandler);
         this.eventBus.on("loaded-protyle-static", this.protyleLoadHandler);
@@ -2473,20 +3112,315 @@ module.exports = class SubDocBlockPlugin extends Plugin {
 
         this.copyCaptureHandler = (event) => {
             try {
-                handleCopyCapture(event);
+                handleCopyCapture(event, this);
             } catch (error) {
                 console.warn(`[${PLUGIN_NAME}]`, "handleCopyCapture failed", error);
             }
         };
         document.addEventListener("copy", this.copyCaptureHandler, true);
         document.addEventListener("cut", this.copyCaptureHandler, true);
+        this.logEvent("plugin.onload.ready");
     }
 
+    async resolvePasteTargetContext(detail) {
+        const protyle = detail?.protyle || getActiveProtyleFromEditors();
+        const { rootDocId, blockId } = await resolveSlashProtyleContext(protyle, null);
+        const afterBlockId = (blockId && blockId !== rootDocId)
+            ? blockId
+            : resolveCursorBlockId(protyle);
+        return {
+            targetParentDocId: rootDocId || null,
+            triggerBlockId: afterBlockId || null,
+        };
+    }
+
+    promoteCutClipboardToCopy(state, source) {
+        if (!state?.subDocId) {
+            return;
+        }
+        setDocClipboardState({
+            ...state,
+            mode: DOC_CLIPBOARD_MODE_COPY,
+            sourceTitle: state.sourceTitle || "未命名",
+            sourceBlockId: null,
+            sourceParentDocId: state.sourceParentDocId || null,
+            source,
+        });
+    }
+
+    async resolveClipboardPasteStrategy(state) {
+        const sourceSubDocId = state?.subDocId;
+        if (!sourceSubDocId) {
+            return { strategy: "duplicate", reason: "missing-source" };
+        }
+        if (!(await isDocumentPresent(sourceSubDocId))) {
+            return { strategy: "invalid", reason: "source-doc-missing" };
+        }
+        if (state.mode === DOC_CLIPBOARD_MODE_COPY) {
+            return { strategy: "duplicate", reason: "copy-mode" };
+        }
+        if (state.mode !== DOC_CLIPBOARD_MODE_CUT) {
+            return { strategy: "duplicate", reason: "unknown-mode" };
+        }
+
+        const existingBlocks = await findSubDocBlockIds(sourceSubDocId);
+        if (existingBlocks.length > 0) {
+            return { strategy: "duplicate", reason: "owner-block-exists", existingBlocks };
+        }
+        if (!(await this.isSubDocInTrash(sourceSubDocId))) {
+            return { strategy: "duplicate", reason: "doc-not-in-trash" };
+        }
+        if (state.sourceBlockId && await isBlockRowPresent(state.sourceBlockId)) {
+            return { strategy: "duplicate", reason: "source-block-restored" };
+        }
+        const canonicalBlockId = await getDocBlockIdFromDoc(sourceSubDocId);
+        if (canonicalBlockId && await isBlockRowPresent(canonicalBlockId)) {
+            return { strategy: "duplicate", reason: "canonical-block-exists", canonicalBlockId };
+        }
+        return { strategy: "reuse", reason: "cut-active-in-trash" };
+    }
+
+    async isCutClipboardStillValid(state) {
+        const { strategy } = await this.resolveClipboardPasteStrategy(state);
+        return strategy === "reuse";
+    }
+
+    async createCopiedSubDocForPaste(sourceSubDocId, targetParentDocId, sourceTitle) {
+        const copyTitle = resolvePasteDocTitle(sourceTitle || await getDocTitle(sourceSubDocId));
+        const pathInfo = await getPathInfoByDocId(targetParentDocId);
+        const notebook = pathInfo?.notebook;
+        this.logEvent("copy-subdoc.start", {
+            sourceSubDocId,
+            targetParentDocId,
+            copyTitle,
+            notebook: notebook || null,
+        });
+        // createDoc 会广播 ws-create；标记为插件发起，避免 onSubDocCreated 再绑一次块。
+        this.creatingSubDocForParent.add(targetParentDocId);
+        try {
+            const markdownResponse = await fetchSyncPost("/api/export/exportMdContent", {
+                id: sourceSubDocId,
+                addTitle: false,
+            });
+            const markdown = markdownResponse.code === 0 && typeof markdownResponse.data?.content === "string"
+                ? markdownResponse.data.content
+                : "";
+
+            if (notebook && pathInfo?.path) {
+                const subDocId = generateNodeId();
+                const newPath = buildChildStoragePath(pathInfo.path, subDocId);
+                const response = await fetchSyncPost("/api/filetree/createDoc", {
+                    notebook,
+                    path: newPath,
+                    title: copyTitle,
+                    md: markdown,
+                });
+                this.logEvent("copy-subdoc.create-doc-response", {
+                    sourceSubDocId,
+                    targetParentDocId,
+                    copyTitle,
+                    path: newPath,
+                    code: response.code,
+                    msg: response.msg,
+                });
+                if (response.code === 0) {
+                    const createdId = typeof response.data === "string" ? response.data : response.data?.id;
+                    if (createdId) {
+                        this.logEvent("copy-subdoc.done", {
+                            sourceSubDocId,
+                            newSubDocId: createdId,
+                            copyTitle,
+                            mode: "createDoc-returned-id",
+                        });
+                        return { subDocId: createdId, title: copyTitle };
+                    }
+                    this.logEvent("copy-subdoc.done", {
+                        sourceSubDocId,
+                        newSubDocId: subDocId,
+                        copyTitle,
+                        mode: "createDoc-fallback-generated-id",
+                    });
+                    return { subDocId, title: copyTitle };
+                }
+                console.warn(`[${PLUGIN_NAME}]`, "createCopiedSubDocForPaste createDoc failed", response);
+            }
+
+            const fallbackId = await this.createSubDocUnderParent(targetParentDocId, copyTitle);
+            if (!fallbackId) {
+                this.logEvent("copy-subdoc.failed", {
+                    sourceSubDocId,
+                    targetParentDocId,
+                    copyTitle,
+                    mode: "fallback-create-subdoc-under-parent",
+                });
+                return null;
+            }
+            this.logEvent("copy-subdoc.done", {
+                sourceSubDocId,
+                newSubDocId: fallbackId,
+                copyTitle,
+                mode: "fallback-create-subdoc-under-parent",
+            });
+            return { subDocId: fallbackId, title: copyTitle };
+        } finally {
+            window.setTimeout(() => this.creatingSubDocForParent.delete(targetParentDocId), 3000);
+        }
+    }
+
+    async tryHandleDocClipboardPaste(event, detail, state) {
+        if (!state?.subDocId || !state?.mode) {
+            return false;
+        }
+        this.logEvent("user.paste.doc-clipboard.detected", {
+            mode: state.mode,
+            subDocId: state.subDocId,
+            sourceParentDocId: state.sourceParentDocId || null,
+            sourceBlockId: state.sourceBlockId || null,
+        });
+        if (!(await isDocumentPresent(state.subDocId))) {
+            clearDocClipboardState();
+            this.logEvent("user.paste.doc-clipboard.invalid-doc-missing", { subDocId: state.subDocId });
+            return false;
+        }
+
+        const { targetParentDocId, triggerBlockId } = await this.resolvePasteTargetContext(detail);
+        if (!targetParentDocId) {
+            this.logEvent("user.paste.doc-clipboard.invalid-target");
+            return false;
+        }
+
+        const pastePlan = await this.resolveClipboardPasteStrategy(state);
+        this.logEvent("user.paste.strategy", {
+            clipboardMode: state.mode,
+            strategy: pastePlan.strategy,
+            reason: pastePlan.reason,
+            subDocId: state.subDocId,
+            existingBlocks: pastePlan.existingBlocks || null,
+            canonicalBlockId: pastePlan.canonicalBlockId || null,
+        });
+        if (pastePlan.strategy === "invalid") {
+            clearDocClipboardState();
+            this.logEvent("user.paste.doc-clipboard.invalid-doc-missing", { subDocId: state.subDocId });
+            return false;
+        }
+
+        const reuseOriginal = pastePlan.strategy === "reuse";
+        if (!reuseOriginal && state.mode === DOC_CLIPBOARD_MODE_CUT) {
+            this.promoteCutClipboardToCopy(state, `paste-${pastePlan.reason}`);
+            this.logEvent("user.paste.cut-fallback-copy", {
+                subDocId: state.subDocId,
+                reason: pastePlan.reason,
+            });
+        }
+
+        let subDocId = null;
+        let titleHint = state.sourceTitle || "未命名";
+        const pasteSource = reuseOriginal ? "clipboard-cut-paste" : "clipboard-copy-paste";
+
+        if (reuseOriginal) {
+            subDocId = state.subDocId;
+            this.markRecentDocMove(subDocId, targetParentDocId);
+            await this.enqueueSubDocSync(subDocId, () =>
+                this.moveSubDocToParent(subDocId, targetParentDocId, pasteSource),
+            );
+            titleHint = cleanTitle(await getDocTitle(subDocId)) || titleHint;
+            this.logEvent("user.paste.reuse.move-doc", {
+                subDocId,
+                targetParentDocId,
+                triggerBlockId,
+            });
+        } else {
+            const duplicated = await this.createCopiedSubDocForPaste(state.subDocId, targetParentDocId, state.sourceTitle);
+            if (!duplicated?.subDocId) {
+                this.logEvent("user.paste.duplicate-failed", {
+                    sourceSubDocId: state.subDocId,
+                    targetParentDocId,
+                });
+                return false;
+            }
+            subDocId = duplicated.subDocId;
+            titleHint = duplicated.title;
+            this.logEvent("user.paste.duplicate-created", {
+                sourceSubDocId: state.subDocId,
+                newSubDocId: subDocId,
+                targetParentDocId,
+            });
+        }
+
+        const bound = await this.bindSubDocBlock(
+            targetParentDocId,
+            subDocId,
+            pasteSource,
+            titleHint,
+            triggerBlockId,
+        );
+        if (!bound) {
+            this.logEvent("user.paste.doc-clipboard.bind-failed", {
+                strategy: pastePlan.strategy,
+                subDocId,
+                targetParentDocId,
+            });
+            return false;
+        }
+
+        if (reuseOriginal) {
+            clearDocClipboardState();
+        }
+        this.logEvent("user.paste.doc-clipboard.done", {
+            strategy: pastePlan.strategy,
+            reason: pastePlan.reason,
+            subDocId,
+            targetParentDocId,
+        });
+        return true;
+    }
+
+    /**
+     * paste 事件同步入口。
+     *
+     * 关键约束（对应 SiYuan 插件示例的官方说明）：
+     * “如果需异步处理请调用 preventDefault，否则会进行默认处理；
+     *   如果使用了 preventDefault，必须调用 resolve，否则程序会卡死”。
+     *
+     * 之前的实现是 `async handlePasteEvent` 整个函数一路 await 到底才调用
+     * `event.preventDefault()`，SiYuan 在 emit "paste" 之后会同步检查
+     * `event.defaultPrevented`：只要我们还没来得及跑完前面的 await，
+     * SiYuan 就已经按默认粘贴处理插入内容了。随后插件的异步逻辑又另外
+     * 创建/绑定了一次块，两边各自提交事务，互相打架，
+     * 这正是日志里 `txerr` / “invalid data tree” 的根因。
+     *
+     * 修复方式：在这里同步判断“是否要接管这次粘贴”，如果要接管，
+     * 必须在本函数返回之前（不能有任何 await）调用 preventDefault，
+     * 再把真正的异步处理转到 finishDocClipboardPaste 里执行；
+     * 无论后续异步逻辑成功与否，最终都必须调用一次 detail.resolve，
+     * 避免卡死编辑器。
+     */
     handlePasteEvent(event) {
         const detail = event?.detail;
         if (!detail) {
             return;
         }
+        this.logEvent("user.paste.raw", {
+            hasSiyuanHTML: !!detail.siyuanHTML,
+            hasTextHTML: !!detail.textHTML,
+            textPlainLength: String(detail.textPlain || "").length,
+        });
+
+        const clipboardState = getDocClipboardState();
+        if (clipboardState?.subDocId && clipboardState?.mode) {
+            event.preventDefault();
+            const noopPayload = resolvePasteNoop(detail);
+            detail.__docBlockPasteResolved = true;
+            this.logEvent("user.paste.doc-clipboard.claimed", {
+                mode: clipboardState.mode,
+                subDocId: clipboardState.subDocId,
+                resolveTiming: "sync",
+                resolvePayload: noopPayload,
+            });
+            this.finishDocClipboardPaste(event, detail, clipboardState);
+            return;
+        }
+
         const processed = processPasteContent(detail.siyuanHTML, detail.textHTML, detail.textPlain, detail.protyle);
         if (!processed.changed) {
             return;
@@ -2497,6 +3431,46 @@ module.exports = class SubDocBlockPlugin extends Plugin {
             textPlain: processed.textPlain,
             siyuanHTML: processed.siyuanHTML,
         });
+    }
+
+    /** event.preventDefault() 与 detail.resolve 已在 handlePasteEvent 同步完成；这里只负责异步创建/绑定。 */
+    async finishDocClipboardPaste(event, detail, state) {
+        try {
+            const handled = await this.tryHandleDocClipboardPaste(event, detail, state);
+            if (handled) {
+                return;
+            }
+        } catch (error) {
+            console.warn(`[${PLUGIN_NAME}]`, "finishDocClipboardPaste failed", error);
+            this.logEvent("user.paste.doc-clipboard.exception", {
+                message: String(error?.message || error),
+            });
+        }
+        if (detail.__docBlockPasteResolved) {
+            this.logEvent("user.paste.doc-clipboard.async-failed-after-sync-resolve", {});
+            showMessage(this.i18n?.createBlockFailed || "文档块粘贴失败");
+            return;
+        }
+        this.resolvePasteWithFallback(detail);
+    }
+
+    /** 已 preventDefault 但插件自定义处理未成功时的兜底：优先退回“内容规范化”结果，否则原样恢复剪贴板内容，确保 resolve 一定被调用。 */
+    resolvePasteWithFallback(detail) {
+        const processed = processPasteContent(detail.siyuanHTML, detail.textHTML, detail.textPlain, detail.protyle);
+        if (processed.changed) {
+            detail.resolve({
+                textHTML: processed.textHTML,
+                textPlain: processed.textPlain,
+                siyuanHTML: processed.siyuanHTML,
+            });
+        } else {
+            detail.resolve({
+                textHTML: detail.textHTML || "",
+                textPlain: detail.textPlain || "",
+                siyuanHTML: detail.siyuanHTML || "",
+            });
+        }
+        this.logEvent("user.paste.doc-clipboard.fallback-resolve", {});
     }
 
     async resolveDocBlockIds(subDocId) {
@@ -2517,7 +3491,7 @@ module.exports = class SubDocBlockPlugin extends Plugin {
         if (!blockId || !docId) {
             return false;
         }
-        const attrsOk = await setDocBlockAttrs(blockId, docId);
+        const attrsOk = await writeDocBlockBinding(blockId, docId);
         if (!attrsOk) {
             console.warn(`[${PLUGIN_NAME}]`, "reapplyDocBlockAttrs failed", { blockId, docId });
             return false;
@@ -2592,7 +3566,14 @@ module.exports = class SubDocBlockPlugin extends Plugin {
     }
 
     async createSubDocFromSlash(protyle, nodeElement) {
-        const { rootDocId, blockId: triggerBlockId } = await resolveSlashProtyleContext(protyle, nodeElement);
+        const { rootDocId, blockId: triggerBlockId, protyle: resolvedProtyle } = await resolveSlashProtyleContext(protyle, nodeElement);
+        this.logEvent("slash.create.context", {
+            rootDocId,
+            triggerBlockId,
+            hasNodeElement: !!nodeElement,
+            activeRootId: resolvedProtyle?.block?.rootID || resolvedProtyle?.block?.rootId || null,
+            triggerRootId: triggerBlockId ? await getBlockRootId(triggerBlockId) : null,
+        });
         if (!rootDocId) {
             console.warn(`[${PLUGIN_NAME}]`, "createSubDocFromSlash: parent doc not found", { protyle, nodeElement });
             showMessage(this.i18n.createDocFailed);
@@ -2600,6 +3581,7 @@ module.exports = class SubDocBlockPlugin extends Plugin {
         }
 
         clearSlashTextInBlock(nodeElement);
+        syncSlashToolbarRange(resolvedProtyle, nodeElement);
         this.slashInProgressForParent = rootDocId;
         try {
             const title = "未命名";
@@ -2608,6 +3590,14 @@ module.exports = class SubDocBlockPlugin extends Plugin {
                 return;
             }
 
+            this.markRecentCreate(rootDocId, subDocId);
+            const pushedBack = pushProtyleBackStack(resolvedProtyle, triggerBlockId, nodeElement);
+            this.logEvent("slash.create.pushBack", {
+                pushedBack,
+                triggerBlockId,
+                parentDocId: rootDocId,
+                backStackSize: window.siyuan?.backStack?.length || 0,
+            });
             if (this.app) {
                 openTab({
                     app: this.app,
@@ -2640,32 +3630,13 @@ module.exports = class SubDocBlockPlugin extends Plugin {
             }
 
             const childTitle = title || "未命名";
-            const parentHPath = await getHPathByDocId(parentDocId);
-            if (parentHPath) {
-                const childHPath = `${parentHPath.replace(/\/+$/, "")}/${childTitle}`;
-                const mdResponse = await fetchSyncPost("/api/filetree/createDocWithMd", {
-                    notebook,
-                    path: childHPath,
-                    markdown: "",
-                });
-                if (mdResponse.code === 0) {
-                    const createdId = typeof mdResponse.data === "string"
-                        ? mdResponse.data
-                        : mdResponse.data?.id;
-                    if (createdId) {
-                        return createdId;
-                    }
-                } else {
-                    console.warn(`[${PLUGIN_NAME}]`, "createDocWithMd failed", mdResponse);
-                }
-            }
-
             if (!pathInfo?.path) {
                 console.warn(`[${PLUGIN_NAME}]`, "createSubDocUnderParent: storage path missing", parentDocId, pathInfo);
                 showMessage(this.i18n.createDocFailed);
                 return null;
             }
 
+            // 禁止使用 createDocWithMd + hpath：同名文档（如多个「未命名」）会导致子文档挂到错误父文档下。
             const subDocId = preferredSubDocId || generateNodeId();
             const newPath = buildChildStoragePath(pathInfo.path, subDocId);
             const response = await fetchSyncPost("/api/filetree/createDoc", {
@@ -2822,6 +3793,9 @@ module.exports = class SubDocBlockPlugin extends Plugin {
             if (typeof data.autoClearTrashOnStartup === "boolean") {
                 next.autoClearTrashOnStartup = data.autoClearTrashOnStartup;
             }
+            if (typeof data.debugReconcile === "boolean") {
+                next.debugReconcile = data.debugReconcile;
+            }
         }
         this.config = next;
     }
@@ -2912,6 +3886,20 @@ module.exports = class SubDocBlockPlugin extends Plugin {
                 return input;
             },
         });
+        this.setting.addItem({
+            title: this.i18n.debugReconcile,
+            description: this.i18n.debugReconcileDesc,
+            createActionElement: () => {
+                const input = document.createElement("input");
+                input.className = "b3-switch";
+                input.type = "checkbox";
+                input.checked = !!this.config.debugReconcile;
+                input.addEventListener("change", () => {
+                    this.config.debugReconcile = input.checked;
+                });
+                return input;
+            },
+        });
         const clearBtn = document.createElement("button");
         clearBtn.className = "b3-button b3-button--outline fn__flex-center fn__size200";
         clearBtn.textContent = this.i18n.clearTrashNow;
@@ -2960,14 +3948,14 @@ module.exports = class SubDocBlockPlugin extends Plugin {
             if (source === "manual") {
                 showMessage(this.i18n.clearTrashRunning);
             }
-            const trashNotebook = await this.resolveTrashNotebook();
-            if (!trashNotebook?.id) {
+            const trashNotebookId = await this.ensureTrashNotebook();
+            if (!trashNotebookId) {
                 if (source === "manual") {
                     showMessage(this.i18n.trashNotebookFailed);
                 }
                 return { deleted: 0, kept: 0 };
             }
-            const docIds = await listDocIdsInNotebook(trashNotebook.id);
+            const docIds = await listDocIdsInNotebook(trashNotebookId);
             let deleted = 0;
             let kept = 0;
             for (const docId of docIds) {
@@ -2995,12 +3983,14 @@ module.exports = class SubDocBlockPlugin extends Plugin {
     }
 
     async resolveTrashNotebook() {
-        const notebook = await findNotebookByName(TRASH_NOTEBOOK_NAME);
+        const notebook = await findTrashNotebook();
         this.trashNotebookId = notebook?.id || null;
         return notebook;
     }
 
+    /** 定位垃圾箱笔记本；不存在则自动创建后再返回 id */
     async ensureTrashNotebook() {
+        this.logEvent("trash.ensure.start");
         if (this.trashNotebookEnsurePromise) {
             return this.trashNotebookEnsurePromise;
         }
@@ -3013,22 +4003,25 @@ module.exports = class SubDocBlockPlugin extends Plugin {
     }
 
     async _ensureTrashNotebookImpl() {
-        let notebook = await findNotebookByName(TRASH_NOTEBOOK_NAME);
+        let notebook = await findTrashNotebook();
         if (notebook?.id) {
             this.trashNotebookId = notebook.id;
+            this.logEvent("trash.ensure.found", { notebookId: notebook.id });
             console.log(`[${PLUGIN_NAME}]`, "ensureTrashNotebook found by name", notebook.id);
             return notebook.id;
         }
 
+        this.logEvent("trash.ensure.create", { name: TRASH_NOTEBOOK_NAME });
         console.log(`[${PLUGIN_NAME}]`, "ensureTrashNotebook creating", TRASH_NOTEBOOK_NAME);
         const response = await fetchSyncPost("/api/notebook/createNotebook", {
             name: TRASH_NOTEBOOK_NAME,
             icon: "iconTrashcan",
         });
 
-        notebook = await waitForNotebookByName(TRASH_NOTEBOOK_NAME);
+        notebook = await waitForTrashNotebook();
         if (notebook?.id) {
             this.trashNotebookId = notebook.id;
+            this.logEvent("trash.ensure.ready", { notebookId: notebook.id, createCode: response.code, createMsg: response.msg });
             console.log(`[${PLUGIN_NAME}]`, "ensureTrashNotebook ready", notebook.id, { createCode: response.code });
             return notebook.id;
         }
@@ -3039,6 +4032,7 @@ module.exports = class SubDocBlockPlugin extends Plugin {
             showMessage(this.i18n.trashNotebookFailed);
         }
         this.trashNotebookId = null;
+        this.logEvent("trash.ensure.failed", { code: response.code, msg: response.msg });
         return null;
     }
 
@@ -3109,6 +4103,11 @@ module.exports = class SubDocBlockPlugin extends Plugin {
             pending.parentDocId = parentDocId;
         }
         pending.updatedAt = Date.now();
+        if (intent === "trash") {
+            this.ensureTrashNotebook().catch((error) => {
+                console.warn(`[${PLUGIN_NAME}]`, "ensureTrashNotebook before trash move failed", error);
+            });
+        }
         if (pending.timer) {
             window.clearTimeout(pending.timer);
         }
@@ -3117,6 +4116,7 @@ module.exports = class SubDocBlockPlugin extends Plugin {
                 console.warn(`[${PLUGIN_NAME}]`, "flushDocMove failed", subDocId, error);
             });
         }, DOC_MOVE_DEBOUNCE_MS);
+        this.logEvent("doc-move.schedule", { subDocId, intent, blockId, parentDocId, source });
         console.log(`[${PLUGIN_NAME}]`, "scheduleDocMove", { subDocId, intent, blockId, parentDocId, source });
     }
 
@@ -3132,8 +4132,14 @@ module.exports = class SubDocBlockPlugin extends Plugin {
 
         await fetchSyncPost("/api/sqlite/flushTransaction", {});
         const { intent, blockId, parentDocId, source } = pending;
+        this.logEvent("doc-move.flush", { subDocId, intent, blockId, parentDocId, source });
 
         if (intent === "trash") {
+            const trashNotebookId = await this.ensureTrashNotebook();
+            if (!trashNotebookId) {
+                console.warn(`[${PLUGIN_NAME}]`, "flushDocMove trash aborted: no trash notebook", { subDocId, source });
+                return;
+            }
             await this.moveSubDocsToTrash([subDocId], source);
             return;
         }
@@ -3168,6 +4174,7 @@ module.exports = class SubDocBlockPlugin extends Plugin {
         const trashNotebookId = await this.ensureTrashNotebook();
         if (!trashNotebookId) {
             console.warn(`[${PLUGIN_NAME}]`, `moveSubDocsToTrash(${source}) aborted: no trash notebook`, subDocIds);
+            this.logEvent("doc-move.to-trash.aborted", { source, subDocIds });
             return;
         }
 
@@ -3196,6 +4203,13 @@ module.exports = class SubDocBlockPlugin extends Plugin {
             fromIDs: ids,
             toID: trashNotebookId,
         });
+        this.logEvent("doc-move.to-trash", {
+            source,
+            subDocIds: ids,
+            trashNotebookId,
+            code: response.code,
+            msg: response.msg,
+        });
         console.log(`[${PLUGIN_NAME}]`, `moveSubDocsToTrash(${source})`, { subDocIds: ids, trashNotebookId }, response);
         if (response.code !== 0 && (await Promise.all(ids.map((id) => isDocumentPresent(id)))).some(Boolean)) {
             showMessage(`${this.i18n.moveToTrashFailed}: ${response.msg}`);
@@ -3206,6 +4220,18 @@ module.exports = class SubDocBlockPlugin extends Plugin {
         const rows = await loadAllSubDocBlockMappings();
         rows.forEach((row) => this.rememberBlockSubDoc(row.id, row.sub_doc_id));
         console.log(`[${PLUGIN_NAME}]`, `refreshBlockSubDocCache(${source})`, rows.length);
+    }
+
+    scheduleRefreshBlockSubDocCache(source) {
+        if (this.cacheRefreshTimer) {
+            window.clearTimeout(this.cacheRefreshTimer);
+        }
+        this.cacheRefreshTimer = window.setTimeout(() => {
+            this.cacheRefreshTimer = null;
+            this.refreshBlockSubDocCache(source).catch((error) => {
+                console.warn(`[${PLUGIN_NAME}]`, "refreshBlockSubDocCache failed", error);
+            });
+        }, 300);
     }
 
     rememberBlockSubDoc(blockId, subDocId) {
@@ -3230,11 +4256,180 @@ module.exports = class SubDocBlockPlugin extends Plugin {
         if (!(await isBlockRowPresent(blockId))) {
             return null;
         }
-        const subDocId = await getSubDocIdFromBlock(blockId);
+        const subDocId = await getSubDocIdFromBlock(blockId, { strict: true });
         if (subDocId) {
             this.rememberBlockSubDoc(blockId, subDocId);
         }
         return subDocId;
+    }
+
+    /**
+     * 同一子文档的移动/绑定操作串行化，避免 fetch+ws 双通道或块/树互相同步打架。
+     */
+    enqueueSubDocSync(subDocId, task) {
+        if (!subDocId) {
+            return Promise.resolve();
+        }
+        const prev = this.subDocSyncChains.get(subDocId) || Promise.resolve();
+        const next = prev
+            .catch(() => {})
+            .then(() => task())
+            .catch((error) => {
+                console.warn(`[${PLUGIN_NAME}]`, "enqueueSubDocSync failed", subDocId, error);
+            });
+        this.subDocSyncChains.set(subDocId, next);
+        next.finally(() => {
+            if (this.subDocSyncChains.get(subDocId) === next) {
+                this.subDocSyncChains.delete(subDocId);
+            }
+        });
+        return next;
+    }
+
+    enqueueParentSync(parentDocId, task) {
+        if (!parentDocId) {
+            return Promise.resolve();
+        }
+        const prev = this.parentSyncChains.get(parentDocId) || Promise.resolve();
+        const next = prev
+            .catch(() => {})
+            .then(() => task())
+            .catch((error) => {
+                console.warn(`[${PLUGIN_NAME}]`, "enqueueParentSync failed", parentDocId, error);
+            });
+        this.parentSyncChains.set(parentDocId, next);
+        next.finally(() => {
+            if (this.parentSyncChains.get(parentDocId) === next) {
+                this.parentSyncChains.delete(parentDocId);
+            }
+        });
+        return next;
+    }
+
+    isDebugReconcileEnabled() {
+        return !!this.config?.debugReconcile;
+    }
+
+    debugReconcileLog(tag, payload = {}) {
+        this.logEvent(`debug.reconcile.${tag}`, payload);
+        if (!this.isDebugReconcileEnabled()) {
+            return;
+        }
+        console.log(`[${PLUGIN_NAME}]`, `[reconcile:${tag}]`, payload);
+    }
+
+    pruneRecentMoveEventKeys() {
+        const now = Date.now();
+        for (const [key, record] of this.recentMoveEventKeys) {
+            const ts = record?.at || 0;
+            if (now - ts > MOVE_DEDUPE_MS * 6) {
+                this.recentMoveEventKeys.delete(key);
+            }
+        }
+    }
+
+    scheduleParentReconcile(parentDocId, mode, source) {
+        // 已停用：不再同步同父文档内「文档树顺序 ↔ 文档块顺序」。
+        this.logEvent("parent-reconcile.skipped", { parentDocId, mode, source });
+    }
+
+    async reconcileParentBlockOrderFromTree(parentDocId, source) {
+        const orderedSubDocs = await listChildDocIdsByParentFromTree(parentDocId);
+        if (orderedSubDocs.length === 0) {
+            this.debugReconcileLog("tree-to-block-empty", { parentDocId, source });
+            this.logEvent("parent-reconcile.tree-to-block.empty", { parentDocId, source });
+            return;
+        }
+        const stats = {
+            parentDocId,
+            source,
+            total: orderedSubDocs.length,
+            movedBlock: 0,
+            boundBlock: 0,
+            skipped: 0,
+        };
+        for (const subDocId of orderedSubDocs) {
+            if (!subDocId || !(await isDocumentPresent(subDocId))) {
+                stats.skipped++;
+                continue;
+            }
+            const moved = await this.moveSubDocBlockToDoc(subDocId, parentDocId, `${source}-reconcile-tree`);
+            if (moved) {
+                stats.movedBlock++;
+                continue;
+            }
+            const blockIds = await findSubDocBlockIds(subDocId);
+            if (blockIds.length > 0) {
+                stats.skipped++;
+                continue;
+            }
+            const title = await getDocTitle(subDocId);
+            this.scheduleBindSubDocBlock(parentDocId, subDocId, `${source}-reconcile-tree-bind`, title);
+            stats.boundBlock++;
+        }
+        this.debugReconcileLog("tree-to-block-done", stats);
+        this.logEvent("parent-reconcile.tree-to-block.done", stats);
+    }
+
+    async reconcileParentTreeOrderFromBlocks(parentDocId, source) {
+        const orderedSubDocs = await listDocBlockSubDocOrderInParent(parentDocId);
+        if (orderedSubDocs.length === 0) {
+            this.debugReconcileLog("block-to-tree-empty", { parentDocId, source });
+            this.logEvent("parent-reconcile.block-to-tree.empty", { parentDocId, source });
+            return;
+        }
+        const stats = {
+            parentDocId,
+            source,
+            total: orderedSubDocs.length,
+            movedDoc: 0,
+            skipped: 0,
+        };
+        for (const subDocId of orderedSubDocs) {
+            if (!subDocId || !(await isDocumentPresent(subDocId)) || await this.isSubDocInTrash(subDocId)) {
+                stats.skipped++;
+                continue;
+            }
+            this.markRecentDocMove(subDocId, parentDocId);
+            this.markRecentDocMove(subDocId, `${parentDocId}::tree-reorder`);
+            await this.moveSubDocToParent(subDocId, parentDocId, `${source}-reconcile-block`);
+            stats.movedDoc++;
+        }
+        this.debugReconcileLog("block-to-tree-done", stats);
+        this.logEvent("parent-reconcile.block-to-tree.done", stats);
+    }
+
+    /** 快速判断是否为插件管理的子文档（避免对普通文档 move 做重型检索） */
+    async isPluginManagedSubDoc(subDocId) {
+        if (!subDocId) {
+            return false;
+        }
+        for (const docId of this.blockToSubDoc.values()) {
+            if (docId === subDocId) {
+                return true;
+            }
+        }
+        if (await getDocBlockIdFromDoc(subDocId)) {
+            return true;
+        }
+        const blockIds = await findSubDocBlockIds(subDocId);
+        return blockIds.length > 0;
+    }
+
+    shouldSkipPluginInitiatedCreate(parentDocId, subDocId) {
+        if (!parentDocId) {
+            return false;
+        }
+        if (this.slashInProgressForParent === parentDocId) {
+            return true;
+        }
+        if (this.creatingSubDocForParent.has(parentDocId)) {
+            return true;
+        }
+        if (subDocId && this.insertingSubDocBlocks.has(subDocId)) {
+            return true;
+        }
+        return false;
     }
 
     shouldSkipRecentSync(subDocId) {
@@ -3252,15 +4447,35 @@ module.exports = class SubDocBlockPlugin extends Plugin {
         if (!blockId || this.pendingBlockCreates.has(blockId)) {
             return;
         }
+        this.logEvent("protyle-change", { blockId });
         const attrs = await queryBlockAttrsFromSql(blockId);
         if (attrs?.[ATTR_BLOCK] === "1" && attrs?.[ATTR_DOC_ID]) {
             this.rememberBlockSubDoc(blockId, attrs[ATTR_DOC_ID]);
+            this.logEvent("protyle-change.remember-binding", {
+                blockId,
+                subDocId: attrs[ATTR_DOC_ID],
+            });
+            const blockEl = document.querySelector(`[data-node-id="${blockId}"]`);
+            if (blockEl) {
+                decorateSubDocBlocks(blockEl, this);
+            }
         }
     }
 
     async handleWsMain(detail) {
         if (!detail?.cmd) {
             return;
+        }
+        this.logEvent("ws-main", {
+            cmd: detail.cmd,
+        });
+        if (detail.cmd === "txerr") {
+            const clipboardState = getDocClipboardState();
+            this.logEvent("ws-main.txerr", {
+                clipboardMode: clipboardState?.mode || null,
+                clipboardSubDocId: clipboardState?.subDocId || null,
+                data: safeSerialize(detail.data),
+            });
         }
         if (WS_LOG_CMDS.has(detail.cmd)) {
             console.log(`[${PLUGIN_NAME}]`, "ws-main", detail.cmd, detail.data);
@@ -3335,9 +4550,15 @@ module.exports = class SubDocBlockPlugin extends Plugin {
 
     async handleWsTransactions(data) {
         const transactions = normalizeWsTransactions(data);
+        this.logEvent("ws-transactions.batch", { count: transactions.length });
         for (const tx of transactions) {
             const { deletedSubDocIds, relocated } = await analyzeTransactionSubDocOps(tx, this);
             const ops = tx.doOperations || tx.DoOperations || [];
+            this.logEvent("ws-transactions.tx", {
+                opCount: ops.length,
+                deletedCount: deletedSubDocIds.size,
+                relocatedCount: relocated.size,
+            });
             const restoringSubDocIds = new Set();
 
             for (const op of ops) {
@@ -3346,6 +4567,14 @@ module.exports = class SubDocBlockPlugin extends Plugin {
                 if (!blockId) {
                     continue;
                 }
+                this.logEvent("ws-transactions.op", {
+                    action,
+                    blockId,
+                    parentID: op?.parentID || op?.parentId || null,
+                    previousID: op?.previousID || op?.previousId || null,
+                    nextID: op?.nextID || op?.nextId || null,
+                    dataId: op?.data?.id || null,
+                });
 
                 if (action === "delete") {
                     this.forgetBlockSubDoc(blockId);
@@ -3353,6 +4582,10 @@ module.exports = class SubDocBlockPlugin extends Plugin {
                 }
 
                 if (action === "move") {
+                    const cachedSubDocId = this.blockToSubDoc.get(blockId);
+                    if (!cachedSubDocId && !isDocBlockOpData(op.data || op?.Data)) {
+                        continue;
+                    }
                     await this.syncSubDocParentForBlock(blockId, op, "ws-transactions-move");
                     continue;
                 }
@@ -3370,6 +4603,13 @@ module.exports = class SubDocBlockPlugin extends Plugin {
                         const parentDocId = await resolveTargetDocIdForOp(op, blockId, this)
                             || await getBlockRootId(blockId);
                         this.rememberBlockSubDoc(blockId, docIdFromData);
+                        const clipboardState = getDocClipboardState();
+                        if (
+                            clipboardState?.mode === DOC_CLIPBOARD_MODE_CUT
+                            && clipboardState.subDocId === docIdFromData
+                        ) {
+                            this.promoteCutClipboardToCopy(clipboardState, "ws-undo-restore");
+                        }
                         this.scheduleDocMove(docIdFromData, "restore", {
                             blockId,
                             parentDocId,
@@ -3449,7 +4689,11 @@ module.exports = class SubDocBlockPlugin extends Plugin {
                 if (restoringSubDocIds.has(subDocId)) {
                     continue;
                 }
-                await this.syncSubDocToTargetParent(subDocId, targetDocId, "ws-transactions-relocate");
+                const syncSubDocId = subDocId;
+                const syncTargetDocId = targetDocId;
+                await this.enqueueSubDocSync(syncSubDocId, () =>
+                    this.syncSubDocToTargetParent(syncSubDocId, syncTargetDocId, "ws-transactions-relocate"),
+                );
             }
         }
     }
@@ -3487,12 +4731,13 @@ module.exports = class SubDocBlockPlugin extends Plugin {
         if (!targetRow) {
             return;
         }
+        await flushSqlTransaction();
         const currentParentDocId = await resolveParentDocId(subDocId);
         if (!currentParentDocId || currentParentDocId === targetParentDocId) {
             return;
         }
         console.log(`[${PLUGIN_NAME}]`, `syncSubDocToTargetParent(${source})`, { subDocId, targetParentDocId });
-        this.markBlockMoving(subDocId);
+        this.markSubDocMoving(subDocId);
         await this.moveSubDocToParent(subDocId, targetParentDocId, source);
     }
 
@@ -3502,18 +4747,22 @@ module.exports = class SubDocBlockPlugin extends Plugin {
         }
 
         let subDocId = extractSubDocIdFromOpData(op?.data || op?.Data);
-        if (!subDocId) {
-            subDocId = await this.resolveSubDocIdForBlock(blockId);
+        if (!subDocId && this.blockToSubDoc.has(blockId)) {
+            subDocId = this.blockToSubDoc.get(blockId);
         }
         if (!subDocId) {
-            return;
+            const binding = await getDocBlockBindingFromBlockId(blockId);
+            if (!binding?.subDocId) {
+                return;
+            }
+            subDocId = binding.subDocId;
         }
 
         let targetDocId = await resolveTargetDocIdForOp(op, blockId, this);
         if (!targetDocId) {
             targetDocId = await getBlockRootId(blockId);
         }
-        if (!targetDocId) {
+        if (!targetDocId || targetDocId === subDocId) {
             return;
         }
 
@@ -3522,8 +4771,20 @@ module.exports = class SubDocBlockPlugin extends Plugin {
             return;
         }
         this.rememberBlockSubDoc(blockId, subDocId);
-        await setDocBlockAttrs(blockId, subDocId);
-        await this.syncSubDocToTargetParent(subDocId, targetDocId, source);
+
+        const currentParentDocId = await resolveParentDocIdFromSql(subDocId);
+        const opAction = getOpAction(op || {});
+        if (currentParentDocId && currentParentDocId === targetDocId && opAction === "move") {
+            this.markRecentDocMove(subDocId, targetDocId);
+            return;
+        }
+
+        const syncSubDocId = subDocId;
+        const syncTargetDocId = targetDocId;
+        const syncSource = source;
+        await this.enqueueSubDocSync(syncSubDocId, () =>
+            this.syncSubDocToTargetParent(syncSubDocId, syncTargetDocId, syncSource),
+        );
     }
 
     async ensureSubDocForBlock(blockId, preferredSubDocId, source) {
@@ -3558,7 +4819,7 @@ module.exports = class SubDocBlockPlugin extends Plugin {
                 this.scheduleDocMove(subDocId, "restore", { blockId, parentDocId, source });
                 return;
             }
-            await setDocBlockAttrs(blockId, subDocId);
+            await writeDocBlockBinding(blockId, subDocId);
             this.rememberBlockSubDoc(blockId, subDocId);
             await this.syncSubDocParentForBlock(blockId, null, `${source}-existing-doc`);
             await this.syncSubDocBlockTitle(subDocId, existingDoc.content, source);
@@ -3579,9 +4840,10 @@ module.exports = class SubDocBlockPlugin extends Plugin {
                 return;
             }
             await this.syncSubDocBlockTitle(subDocId, title, source);
-            await setDocBlockAttrs(blockId, subDocId);
-            this.rememberBlockSubDoc(blockId, subDocId);
-            await setDocBlockIdOnDoc(subDocId, blockId);
+            const bound = await writeDocBlockBinding(blockId, subDocId);
+            if (bound) {
+                this.rememberBlockSubDoc(blockId, subDocId);
+            }
             decorateSubDocBlocks(document, this);
             console.log(`[${PLUGIN_NAME}]`, `ensureSubDocForBlock(${source})`, { blockId, subDocId, parentDocId });
         } finally {
@@ -3603,6 +4865,13 @@ module.exports = class SubDocBlockPlugin extends Plugin {
             fromIDs: [subDocId],
             toID: targetParentDocId,
         });
+        this.logEvent("doc-move.to-parent", {
+            source,
+            subDocId,
+            targetParentDocId,
+            code: response.code,
+            msg: response.msg,
+        });
         console.log(`[${PLUGIN_NAME}]`, `moveSubDocToParent(${source})`, { subDocId, targetParentDocId }, response);
         if (response.code !== 0) {
             showMessage(`${this.i18n.moveDocFailed}: ${response.msg}`);
@@ -3613,6 +4882,7 @@ module.exports = class SubDocBlockPlugin extends Plugin {
         if (!subDocId || !targetParentDocId) {
             return false;
         }
+        this.markBlockMoving(subDocId);
         const blockIds = await findSubDocBlockIds(subDocId);
         if (blockIds.length === 0) {
             return false;
@@ -3631,6 +4901,15 @@ module.exports = class SubDocBlockPlugin extends Plugin {
                 payload.parentID = targetParentDocId;
             }
             const response = await fetchSyncPost("/api/block/moveBlock", payload);
+            this.logEvent("block-move.to-parent", {
+                source,
+                subDocId,
+                blockId,
+                targetParentDocId,
+                payload: safeSerialize(payload),
+                code: response.code,
+                msg: response.msg,
+            });
             console.log(`[${PLUGIN_NAME}]`, `moveSubDocBlockToDoc(${source})`, payload, response);
             if (response.code === 0) {
                 moved = true;
@@ -3647,7 +4926,7 @@ module.exports = class SubDocBlockPlugin extends Plugin {
         const key = `${subDocId}::${targetParentDocId}`;
         const now = Date.now();
         const last = this.recentDocMoveKeys.get(key);
-        if (last && now - last < SYNC_DEDUPE_MS) {
+        if (last && now - last < MOVE_DEDUPE_MS) {
             return true;
         }
         return false;
@@ -3658,7 +4937,52 @@ module.exports = class SubDocBlockPlugin extends Plugin {
         this.recentDocMoveKeys.set(key, Date.now());
     }
 
+    shouldSkipRecentMoveEvent(signature, source) {
+        if (!signature) {
+            return false;
+        }
+        const now = Date.now();
+        const record = this.recentMoveEventKeys.get(signature);
+        if (!record) {
+            return false;
+        }
+        const lastAt = record.at || 0;
+        if (now - lastAt >= MOVE_DEDUPE_MS) {
+            return false;
+        }
+        // 仅跳过跨通道重复（fetch 与 ws-main），同源事件留给子文档去重处理。
+        return record.source && source && record.source !== source;
+    }
+
+    markRecentMoveEvent(signature, source) {
+        if (!signature) {
+            return;
+        }
+        this.pruneRecentMoveEventKeys();
+        this.recentMoveEventKeys.set(signature, {
+            source: source || "unknown",
+            at: Date.now(),
+        });
+    }
+
     async handleDocMove(moveInfo, source) {
+        this.logEvent("doc-move.handle", {
+            source,
+            byId: !!moveInfo?.byId,
+            fromIDs: safeSerialize(moveInfo?.fromIDs || []),
+            fromPaths: safeSerialize(moveInfo?.fromPaths || []),
+            toID: moveInfo?.toID || null,
+            toPath: moveInfo?.toPath || null,
+            toNotebook: moveInfo?.toNotebook || null,
+        });
+        const signature = buildMoveEventSignature(moveInfo);
+        if (this.shouldSkipRecentMoveEvent(signature, source)) {
+            console.log(`[${PLUGIN_NAME}]`, `handleDocMove(${source}) skip duplicate event`, { signature });
+            this.logEvent("doc-move.handle.skip-duplicate", { source, signature });
+            return;
+        }
+        this.markRecentMoveEvent(signature, source);
+
         let movedSubDocIds = [];
         if (moveInfo.byId && Array.isArray(moveInfo.fromIDs)) {
             movedSubDocIds = moveInfo.fromIDs;
@@ -3668,61 +4992,88 @@ module.exports = class SubDocBlockPlugin extends Plugin {
                 .filter(Boolean);
         }
 
-        for (const subDocId of movedSubDocIds) {
-            if (!subDocId || !(await isDocumentPresent(subDocId))) {
-                continue;
-            }
+        const tasks = movedSubDocIds.map((subDocId) =>
+            this.enqueueSubDocSync(subDocId, () => this.handleDocMoveForSubDoc(subDocId, moveInfo, source)),
+        );
+        await Promise.all(tasks);
+    }
 
-            if (isSelfDocTreeMove(subDocId, moveInfo)) {
-                console.log(`[${PLUGIN_NAME}]`, `handleDocMove(${source}) skip self-move`, { subDocId, moveInfo });
-                continue;
-            }
+    async handleDocMoveForSubDoc(subDocId, moveInfo, source) {
+        if (!subDocId || !(await isDocumentPresent(subDocId))) {
+            return;
+        }
+        this.logEvent("doc-move.handle.subdoc.start", { source, subDocId });
 
-            const targetParentDocId = await resolveMoveTargetParentDocId(moveInfo, subDocId, this);
-            if (!targetParentDocId || targetParentDocId === subDocId) {
-                if (await isSubDocAtNotebookRoot(subDocId)) {
-                    if (this.shouldSkipRecentDocMove(subDocId, NOTEBOOK_ROOT_MOVE_KEY)) {
-                        continue;
-                    }
-                    this.markRecentDocMove(subDocId, NOTEBOOK_ROOT_MOVE_KEY);
-                    await this.removeSubDocBlocksOnRootMove(subDocId, source);
-                    continue;
+        if (isSelfDocTreeMove(subDocId, moveInfo)) {
+            console.log(`[${PLUGIN_NAME}]`, `handleDocMove(${source}) skip self-move`, { subDocId, moveInfo });
+            return;
+        }
+
+        const targetParentDocId = await resolveMoveTargetParentDocId(moveInfo, subDocId, this);
+        if (!targetParentDocId || targetParentDocId === subDocId) {
+            if (await isSubDocAtNotebookRoot(subDocId)) {
+                if (!(await this.isPluginManagedSubDoc(subDocId))) {
+                    return;
                 }
-                console.warn(`[${PLUGIN_NAME}]`, `handleDocMove(${source}) missing target`, { subDocId, moveInfo });
-                continue;
+                if (this.shouldSkipRecentDocMove(subDocId, NOTEBOOK_ROOT_MOVE_KEY)) {
+                    return;
+                }
+                this.markRecentDocMove(subDocId, NOTEBOOK_ROOT_MOVE_KEY);
+                await this.removeSubDocBlocksOnRootMove(subDocId, source);
+                return;
             }
+            console.warn(`[${PLUGIN_NAME}]`, `handleDocMove(${source}) missing target`, { subDocId, moveInfo });
+            this.logEvent("doc-move.handle.subdoc.missing-target", { source, subDocId });
+            return;
+        }
 
-            const trashNotebook = await this.resolveTrashNotebook();
-            if (trashNotebook && targetParentDocId === trashNotebook.id) {
-                continue;
-            }
+        const trashNotebook = await this.resolveTrashNotebook();
+        if (trashNotebook && targetParentDocId === trashNotebook.id) {
+            return;
+        }
 
-            const currentParentDocId = await resolveParentDocIdFromSql(subDocId);
-            if (currentParentDocId === targetParentDocId && await areDocBlocksInDoc(subDocId, targetParentDocId)) {
-                console.log(`[${PLUGIN_NAME}]`, `handleDocMove(${source}) skip unchanged parent`, { subDocId, targetParentDocId });
-                continue;
-            }
+        if (this.movingSubDocIds.has(subDocId) || this.movingBlocksForDoc.has(subDocId)) {
+            console.log(`[${PLUGIN_NAME}]`, `handleDocMove(${source}) skip in-flight sync`, { subDocId });
+            this.logEvent("doc-move.handle.subdoc.skip-inflight", { source, subDocId });
+            return;
+        }
 
-            if (this.shouldSkipRecentDocMove(subDocId, targetParentDocId)) {
-                continue;
-            }
+        const blockIds = await findSubDocBlockIds(subDocId);
+        const isNestedChildMove = blockIds.length === 0 && (await resolveParentDocIdFromSql(subDocId));
+        if (blockIds.length === 0 && !isNestedChildMove && !(await this.isPluginManagedSubDoc(subDocId))) {
+            return;
+        }
 
-            const blockIds = await findSubDocBlockIds(subDocId);
-            console.log(`[${PLUGIN_NAME}]`, `handleDocMove(${source})`, { subDocId, targetParentDocId, blockIds });
+        await flushSqlTransaction();
+        const currentParentDocId = await resolveParentDocIdFromSql(subDocId);
+        if (currentParentDocId === targetParentDocId && await areDocBlocksInDoc(subDocId, targetParentDocId)) {
+            return;
+        }
 
-            if (blockIds.length === 0) {
-                const title = await getDocTitle(subDocId);
-                this.markRecentDocMove(subDocId, targetParentDocId);
-                this.scheduleBindSubDocBlock(targetParentDocId, subDocId, `${source}-move-bind`, title);
-                this.clearDocMovePending(subDocId);
-                continue;
-            }
+        if (this.shouldSkipRecentDocMove(subDocId, targetParentDocId)) {
+            return;
+        }
 
+        console.log(`[${PLUGIN_NAME}]`, `handleDocMove(${source})`, { subDocId, targetParentDocId, blockIds });
+        this.logEvent("doc-move.handle.subdoc.target", {
+            source,
+            subDocId,
+            targetParentDocId,
+            blockCount: blockIds.length,
+        });
+
+        if (blockIds.length === 0) {
+            const title = await getDocTitle(subDocId);
             this.markRecentDocMove(subDocId, targetParentDocId);
-            const moved = await this.moveSubDocBlockToDoc(subDocId, targetParentDocId, source);
-            if (moved) {
-                this.clearDocMovePending(subDocId);
-            }
+            this.scheduleBindSubDocBlock(targetParentDocId, subDocId, `${source}-move-bind`, title);
+            this.clearDocMovePending(subDocId);
+            return;
+        }
+
+        this.markRecentDocMove(subDocId, targetParentDocId);
+        const moved = await this.moveSubDocBlockToDoc(subDocId, targetParentDocId, source);
+        if (moved) {
+            this.clearDocMovePending(subDocId);
         }
     }
 
@@ -3741,12 +5092,12 @@ module.exports = class SubDocBlockPlugin extends Plugin {
         if (!subDocId || !parentDocId || parentDocId === subDocId) {
             return;
         }
-        if (this.slashInProgressForParent === parentDocId) {
-            console.log(`[${PLUGIN_NAME}]`, "onSubDocCreated skip slash in-progress", { subDocId, source });
+        if (this.shouldSkipPluginInitiatedCreate(parentDocId, subDocId)) {
+            console.log(`[${PLUGIN_NAME}]`, "onSubDocCreated skip plugin-initiated", { subDocId, parentDocId, source });
             return;
         }
-        if (this.insertingSubDocBlocks.has(subDocId)) {
-            console.log(`[${PLUGIN_NAME}]`, "onSubDocCreated skip in-flight", { subDocId, source });
+        if (this.shouldSkipRecentCreate(parentDocId, subDocId)) {
+            console.log(`[${PLUGIN_NAME}]`, "onSubDocCreated skip recent create", { subDocId, parentDocId, source });
             return;
         }
         console.log(`[${PLUGIN_NAME}]`, "onSubDocCreated", { subDocId, parentDocId, source });
@@ -3757,22 +5108,55 @@ module.exports = class SubDocBlockPlugin extends Plugin {
         if (!subDocId || !parentDocId || this.insertingSubDocBlocks.has(subDocId)) {
             return;
         }
+        this.logEvent("bind.schedule", { parentDocId, subDocId, source, triggerBlockId });
+        this.bindSubDocBlock(parentDocId, subDocId, source, titleHint, triggerBlockId).catch((error) => {
+            console.warn(`[${PLUGIN_NAME}]`, "bindSubDocBlock failed", error);
+        });
+    }
+
+    /**
+     * 所有"确保 subDocId 在 parentDocId 下有对应文档块"的入口都必须走这里——无论是
+     * ws-create 广播触发的 onSubDocCreated，还是复制/剪切粘贴逻辑直接发起绑定。
+     *
+     * 背景（v1.10.21 复制粘贴仍报 invalid data tree 的根因）：
+     * 之前 clipboard-paste 路径直接 `await this.bindSubDocBlock(...)`，绕过了
+     * scheduleBindSubDocBlock 里的 insertingSubDocBlocks 互斥锁；而 createDoc 调用一旦
+     * 返回，内核会广播 ws-main "create" 事件，触发 onSubDocCreated 走 scheduleBindSubDocBlock
+     * 再次绑定同一个 subDocId。两条路径并发执行，各自为同一个新文档创建了一个文档块，
+     * 从日志上看两次 bind.append.done 产生了两个不同的 blockId，SiYuan 内核随即报 txerr /
+     * invalid data tree。
+     *
+     * 修复：把互斥锁下沉到 bindSubDocBlock 内部（唯一入口），并用 Promise 缓存让后来者
+     * 复用同一次绑定结果，而不是各自发起一次绑定。
+     */
+    bindSubDocBlock(parentDocId, subDocId, source, titleHint = null, triggerBlockId = null) {
+        if (!subDocId || !parentDocId || parentDocId === subDocId) {
+            return Promise.resolve(false);
+        }
+        const existingPromise = this.bindSubDocBlockPromises.get(subDocId);
+        if (existingPromise) {
+            this.logEvent("bind.join-inflight", { parentDocId, subDocId, source, triggerBlockId });
+            return existingPromise;
+        }
         this.insertingSubDocBlocks.add(subDocId);
-        this.bindSubDocBlock(parentDocId, subDocId, source, titleHint, triggerBlockId)
+        const promise = this._bindSubDocBlockImpl(parentDocId, subDocId, source, titleHint, triggerBlockId)
             .catch((error) => {
                 console.warn(`[${PLUGIN_NAME}]`, "bindSubDocBlock failed", error);
+                return false;
             })
             .finally(() => {
                 this.insertingSubDocBlocks.delete(subDocId);
+                this.bindSubDocBlockPromises.delete(subDocId);
             });
+        this.bindSubDocBlockPromises.set(subDocId, promise);
+        return promise;
     }
 
-    async bindSubDocBlock(parentDocId, subDocId, source, titleHint = null, triggerBlockId = null) {
+    async _bindSubDocBlockImpl(parentDocId, subDocId, source, titleHint = null, triggerBlockId = null) {
+        this.logEvent("bind.start", { parentDocId, subDocId, source, triggerBlockId });
         console.log(`[${PLUGIN_NAME}]`, `bindSubDocBlock(${source})`, { parentDocId, subDocId, triggerBlockId });
 
-        if (!subDocId || !parentDocId || parentDocId === subDocId) {
-            return false;
-        }
+        await flushSqlTransaction();
 
         if (this.shouldSkipRecentCreate(parentDocId, subDocId)) {
             const existingAfterDedupe = await findSubDocBlockIds(subDocId);
@@ -3785,6 +5169,7 @@ module.exports = class SubDocBlockPlugin extends Plugin {
         if (existing.length > 0) {
             console.log(`[${PLUGIN_NAME}]`, `bindSubDocBlock(${source}) block exists`, existing);
             this.markRecentCreate(parentDocId, subDocId);
+            this.logEvent("bind.skip-existing", { parentDocId, subDocId, source, existingCount: existing.length });
             return true;
         }
 
@@ -3796,36 +5181,78 @@ module.exports = class SubDocBlockPlugin extends Plugin {
         title = title || "未命名";
 
         if (triggerBlockId && triggerBlockId !== parentDocId) {
-            if (!(await isBlockRowPresent(triggerBlockId))) {
-                await ensureBlockReadyAfterSignal(triggerBlockId);
-            }
-            if (await isBlockRowPresent(triggerBlockId)) {
-                const markdown = await buildSubDocBlockMarkdown(subDocId, title, getDocBlockHeadingLevel(this));
-                const updateRes = await fetchSyncPost("/api/block/updateBlock", {
-                    id: triggerBlockId,
-                    dataType: "markdown",
-                    data: markdown,
-                });
-                if (updateRes.code === 0) {
-                    this.markRecentCreate(parentDocId, subDocId);
-                    await setDocBlockAttrs(triggerBlockId, subDocId);
-                    this.rememberBlockSubDoc(triggerBlockId, subDocId);
-                    await setDocBlockIdOnDoc(subDocId, triggerBlockId);
-                    decorateSubDocBlocks(document, this);
-                    console.log(`[${PLUGIN_NAME}]`, `bindSubDocBlock(${source}) updated trigger block`, triggerBlockId);
-                    return true;
+            const replaceTrigger = String(source || "").includes("slash");
+            if (replaceTrigger) {
+                if (!(await isBlockRowPresent(triggerBlockId))) {
+                    await ensureBlockReadyAfterSignal(triggerBlockId);
                 }
-                console.warn(`[${PLUGIN_NAME}]`, `bindSubDocBlock(${source}) updateBlock failed`, updateRes);
-                await this.cleanupSlashTriggerByBlockId(triggerBlockId);
+                if (await isBlockRowPresent(triggerBlockId)) {
+                    const markdown = await buildSubDocBlockMarkdown(subDocId, title, getDocBlockHeadingLevel(this));
+                    const updateRes = await fetchSyncPost("/api/block/updateBlock", {
+                        id: triggerBlockId,
+                        dataType: "markdown",
+                        data: markdown,
+                    });
+                    if (updateRes.code === 0) {
+                        this.markRecentCreate(parentDocId, subDocId);
+                        const bound = await writeDocBlockBinding(triggerBlockId, subDocId);
+                        if (bound) {
+                            this.rememberBlockSubDoc(triggerBlockId, subDocId);
+                        }
+                        decorateSubDocBlocks(document, this);
+                        console.log(`[${PLUGIN_NAME}]`, `bindSubDocBlock(${source}) updated trigger block`, triggerBlockId);
+                        this.logEvent("bind.done-trigger-update", { parentDocId, subDocId, source, triggerBlockId });
+                        return true;
+                    }
+                    console.warn(`[${PLUGIN_NAME}]`, `bindSubDocBlock(${source}) updateBlock failed`, updateRes);
+                    await this.cleanupSlashTriggerByBlockId(triggerBlockId);
+                } else {
+                    console.warn(`[${PLUGIN_NAME}]`, `bindSubDocBlock(${source}) trigger block missing`, triggerBlockId);
+                }
             } else {
-                console.warn(`[${PLUGIN_NAME}]`, `bindSubDocBlock(${source}) trigger block missing`, triggerBlockId);
+                return this.insertSubDocBlockAfter(triggerBlockId, parentDocId, subDocId, source, title);
             }
         }
 
         return this.appendSubDocBlockAtParentEnd(parentDocId, subDocId, source, title);
     }
 
+    async insertSubDocBlockAfter(afterBlockId, parentDocId, subDocId, source, title) {
+        this.logEvent("bind.insert-after.start", { afterBlockId, parentDocId, subDocId, source, title });
+        if (!afterBlockId || !(await isBlockRowPresent(afterBlockId))) {
+            return this.appendSubDocBlockAtParentEnd(parentDocId, subDocId, source, title);
+        }
+        const markdown = await buildSubDocBlockMarkdown(subDocId, title, getDocBlockHeadingLevel(this));
+        const response = await fetchSyncPost("/api/block/insertBlock", {
+            dataType: "markdown",
+            data: markdown,
+            previousID: afterBlockId,
+        });
+        if (response.code !== 0) {
+            this.logEvent("bind.insert-after.failed", {
+                afterBlockId, parentDocId, subDocId, source, code: response.code, msg: response.msg,
+            });
+            return this.appendSubDocBlockAtParentEnd(parentDocId, subDocId, source, title);
+        }
+        const blockId = extractNewBlockId(response);
+        if (!blockId || blockId === subDocId) {
+            this.logEvent("bind.insert-after.failed-invalid-block-id", { afterBlockId, parentDocId, subDocId, source, blockId });
+            return false;
+        }
+        this.markRecentCreate(parentDocId, subDocId);
+        this.rememberBlockSubDoc(blockId, subDocId);
+        const bound = await writeDocBlockBinding(blockId, subDocId);
+        if (!bound) {
+            this.logEvent("bind.insert-after.failed-binding", { afterBlockId, parentDocId, subDocId, source, blockId });
+            return false;
+        }
+        decorateSubDocBlocks(document, this);
+        this.logEvent("bind.insert-after.done", { afterBlockId, parentDocId, subDocId, source, blockId });
+        return true;
+    }
+
     async appendSubDocBlockAtParentEnd(parentDocId, subDocId, source, title) {
+        this.logEvent("bind.append.start", { parentDocId, subDocId, source, title });
         console.log(`[${PLUGIN_NAME}]`, `appendSubDocBlockAtParentEnd(${source})`, { parentDocId, subDocId, title });
 
         const parentRow = await getDocumentRow(parentDocId);
@@ -3843,21 +5270,28 @@ module.exports = class SubDocBlockPlugin extends Plugin {
         console.log(`[${PLUGIN_NAME}]`, `appendSubDocBlockAtParentEnd(${source}) result`, response);
 
         if (response.code !== 0) {
+            this.logEvent("bind.append.failed", { parentDocId, subDocId, source, code: response.code, msg: response.msg });
             showMessage(`${this.i18n.createBlockFailed}: ${response.msg}`);
             return false;
         }
 
         const blockId = extractNewBlockId(response);
         if (!blockId || blockId === subDocId) {
+            this.logEvent("bind.append.failed-invalid-block-id", { parentDocId, subDocId, source, blockId });
             return false;
         }
 
         this.markRecentCreate(parentDocId, subDocId);
         this.rememberBlockSubDoc(blockId, subDocId);
-        await setDocBlockAttrs(blockId, subDocId);
-        await setDocBlockIdOnDoc(subDocId, blockId);
+        const bound = await writeDocBlockBinding(blockId, subDocId);
+        if (!bound) {
+            console.warn(`[${PLUGIN_NAME}]`, `appendSubDocBlockAtParentEnd(${source}) write binding failed`, { blockId, subDocId });
+            this.logEvent("bind.append.failed-binding", { parentDocId, subDocId, source, blockId });
+            return false;
+        }
         decorateSubDocBlocks(document, this);
         console.log(`[${PLUGIN_NAME}]`, "appendSubDocBlockAtParentEnd ready", { blockId, subDocId, parentDocId });
+        this.logEvent("bind.append.done", { parentDocId, subDocId, source, blockId });
         return true;
     }
 
@@ -3894,13 +5328,23 @@ module.exports = class SubDocBlockPlugin extends Plugin {
     }
 
     handleCreateFromApi(requestBody, responsePayload, source) {
-        const { subDocId, parentDocId, title } = this.extractCreateIds(requestBody, responsePayload);
-        console.log(`[${PLUGIN_NAME}]`, `handleCreateFromApi(${source})`, {
-            subDocId,
-            parentDocId,
-            path: requestBody?.path,
+        const { subDocId, parentDocId: parsedParent, title } = this.extractCreateIds(requestBody, responsePayload);
+        const run = async () => {
+            let parentDocId = parsedParent;
+            if (subDocId && !parentDocId) {
+                await flushSqlTransaction();
+                parentDocId = await resolveParentDocIdFromSql(subDocId);
+            }
+            console.log(`[${PLUGIN_NAME}]`, `handleCreateFromApi(${source})`, {
+                subDocId,
+                parentDocId,
+                path: requestBody?.path,
+            });
+            this.onSubDocCreated(subDocId, parentDocId, source, title);
+        };
+        run().catch((error) => {
+            console.warn(`[${PLUGIN_NAME}]`, `handleCreateFromApi(${source}) failed`, error);
         });
-        this.onSubDocCreated(subDocId, parentDocId, source, title);
     }
 
     async removeLinkedSubDoc(subDocId, source) {
@@ -3959,6 +5403,19 @@ module.exports = class SubDocBlockPlugin extends Plugin {
                 try {
                     body = JSON.parse(init.body);
                     ctx = await prepareApiContext(url, body, plugin);
+                    plugin.logEvent("fetch.capture", {
+                        url,
+                        hasContext: !!ctx,
+                        bodyKeys: body && typeof body === "object" ? Object.keys(body) : [],
+                    });
+                    if (url.includes("/api/transactions") && body?.transactions) {
+                        const opSummary = summarizeTransactionOps(body.transactions);
+                        plugin.logEvent("fetch.transactions.submit", {
+                            opCount: opSummary.length,
+                            emptyIdOps: opSummary.filter((op) => op.hasEmptyId).length,
+                            ops: opSummary.slice(0, 12),
+                        });
+                    }
                 } catch (error) {
                     console.warn(`[${PLUGIN_NAME}]`, "parse fetch body failed", error);
                 }
@@ -3970,8 +5427,10 @@ module.exports = class SubDocBlockPlugin extends Plugin {
                 response.clone().json().then((payload) => {
                     if (payload?.code !== 0) {
                         console.warn(`[${PLUGIN_NAME}]`, "create API failed", payload);
+                        plugin.logEvent("fetch.create.failed", { url, code: payload?.code, msg: payload?.msg });
                         return;
                     }
+                    plugin.logEvent("fetch.create.success", { url, code: payload?.code || 0 });
                     plugin.handleCreateFromApi(ctx.create.body, payload, ctx.create.source);
                 }).catch((error) => {
                     console.warn(`[${PLUGIN_NAME}]`, "read create response failed", error);
@@ -3981,8 +5440,10 @@ module.exports = class SubDocBlockPlugin extends Plugin {
             if (shouldApplyApiContext(url, ctx)) {
                 response.clone().json().then(async (payload) => {
                     if (payload?.code !== 0) {
+                        plugin.logEvent("fetch.apply-context.skip-non-zero", { url, code: payload?.code, msg: payload?.msg });
                         return;
                     }
+                    plugin.logEvent("fetch.apply-context", { url, code: payload?.code || 0 });
                     await applyApiContext(ctx, plugin, "fetch");
                 }).catch(() => {});
             }
@@ -3994,9 +5455,22 @@ module.exports = class SubDocBlockPlugin extends Plugin {
     }
 
     onunload() {
+        this.logEvent("plugin.onunload.start");
         for (const subDocId of [...this.docMovePending.keys()]) {
             this.clearDocMovePending(subDocId);
         }
+        this.subDocSyncChains.clear();
+        this.recentMoveEventKeys.clear();
+        this.parentSyncChains.clear();
+        for (const timer of this.parentReconcileTimers.values()) {
+            window.clearTimeout(timer);
+        }
+        this.parentReconcileTimers.clear();
+        if (this.cacheRefreshTimer) {
+            window.clearTimeout(this.cacheRefreshTimer);
+            this.cacheRefreshTimer = null;
+        }
+        clearDocClipboardState();
         if (this.wsHandler) {
             this.eventBus.off("ws-main", this.wsHandler);
             this.wsHandler = null;
@@ -4024,6 +5498,8 @@ module.exports = class SubDocBlockPlugin extends Plugin {
             window.fetch = this.originalFetch;
             window.__subDocBlockFetchPatched = false;
         }
+        this.logEvent("plugin.onunload.done");
+        this.uninstallConsoleMirror();
         console.log(`${PLUGIN_NAME} 插件已卸载`);
     }
 };
