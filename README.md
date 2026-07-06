@@ -27,9 +27,3 @@
 
 
 
-
-
-
-# 在线乞讨
-
-<img src="image.png" width="50%">
